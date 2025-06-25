@@ -2,3 +2,4 @@
 parsed/
 logs/
 rag_cache/
+bot/__pycache__/
