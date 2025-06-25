@@ -1,0 +1,4 @@
+.env
+parsed/
+logs/
+rag_cache/
