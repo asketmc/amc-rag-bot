@@ -208,7 +208,7 @@ Run the bot
 ```text
 python main.py
 ```
-⚡ Why This Matters
+## ⚡ Why This Matters
 This project shows how an LLM QA Engineer or RAG Architect can:
 
 Build a working hybrid retrieval system
@@ -221,7 +221,7 @@ Deliver results under real constraints (2 days, no prior Python background)
 
 Use this repo as a reference, PoC baseline, or technical interview sample.
 
-🛡 License
+## 🛡 License
 MIT
 
 📬 Contact: asketmc.team+ragbot@gmail.com
