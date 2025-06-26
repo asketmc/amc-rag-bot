@@ -31,14 +31,54 @@ It supports structured configs, multilingual corpora, and real-world adaptation 
 
 ## 🔍 Key Features
 
-- **Hybrid Retrieval**: vector search (BAAI/bge) + keyword fallback with score filtering
-- **Async-safe rerank**: `BAAI/bge-reranker-v2-m3` with thread pool + CPU/GPU switch
-- **Lemmatized KB**: Russian+English, SHA256 cache, sentence chunking, per-file indices
-- **Discord Bot**: role-based access, command parsing, cooldowns, message sanitization
-- **Fault Tolerance**: automatic fallback to local LLM on OpenRouter errors
-- **Full Logging**: rotating logs per module (`chat`, `embedding`, `errors`, etc.)
-- **Configurable**: `.env` + `config.py` + isolated prompt files (`system_prompt.txt`, etc.)
-- **Flexible Backend**: tested with multiple LLMs, easily switchable via config
+- **Hybrid Retrieval**: vector search (BAAI/bge) + keyword fallback with score filtering  
+- **Async-safe rerank**: `BAAI/bge-reranker-v2-m3` with thread pool + CPU/GPU switch  
+- **Lemmatized KB**: Russian+English, SHA256 cache, sentence chunking, per-file indices  
+- **Discord Bot**: role-based access, command parsing, cooldowns, message sanitization  
+- **Fault Tolerance**: automatic fallback to local LLM on OpenRouter errors  
+- **Full Logging**: rotating logs per module (`chat`, `embedding`, `errors`, etc.)  
+- **Configurable**: `.env` + `config.py` + isolated prompt files (`system_prompt.txt`, etc.)  
+- **Flexible Backend**: tested with multiple LLMs, easily switchable via config  
+
+---
+
+## 🧠 Advanced Multistep RAG (`!multy`)
+
+The `!multy` command implements a **multi-question, dual-rerank pipeline** for complex queries — ideal for lore-heavy worlds or layered documentation.
+
+---
+
+### ⚙️ How it works
+
+**Step 1:** Decompose original query `Q0` → [`Q1`, `Q2`, `Q3`] via LLM
+
+**Step 2:** For each `Qn`:
+- Retrieve top‑**K** chunks (_default: 18, `config.RERANK_INPUT_K`_)
+- Rerank with `CrossEncoder` (`BAAI/bge-reranker-v2-m3`)
+- Select top‑**R** chunks (_default: 9, `config.RERANK_OUTPUT_K`_) via semantic + lemma-based filtering
+
+**Step 3:** Merge all filtered chunks → `[C1 ... Cn]`
+
+**Step 4:** Final rerank: `Q0` vs `[C1 ... Cn]`
+- Select top‑**F** chunks (_default: 16, `config.TOP_K`_) for context
+
+**Step 5:** Query LLM with:
+- `SYSTEM` prompt  
+- Final `CONTEXT`  
+- Original `QUESTION = Q0`
+
+---
+
+### ✅ Benefits
+
+- ✅ **High recall** — decomposition covers multiple facets of the original query  
+- ✅ **Per‑question relevance** — each `Qn` is filtered independently  
+- ✅ **Global coherence** — final rerank aligns all content to the original `Q0`  
+- ✅ **Low hallucination** — responses are grounded in retrieved facts only  
+
+Parameters like `K`, `R`, `F` are fully configurable in `config.py`.
+
+> This structure is ideal for **multi-hop RAG**, world modeling, and decomposed fact retrieval.
 
 ---
 
@@ -74,35 +114,31 @@ If OpenRouter is unavailable (e.g., quota exceeded or downtime), it falls back t
 ---
 
 ## 📁 File Layout
-
-```
+```text
 /LLM
-├── bot/                        # Main bot application (entry point, core logic)
-│   ├── main.py                 # Entry point: init, load index, launch Discord bot
-│   ├── config.py               # Global settings and constants
-│   ├── rerank.py               # CrossEncoder reranking logic
-│   ├── requirements.txt        # Python dependencies (active version)
-│   ├── requirements-backup.txt # Backup dependency list (pip freeze)
-│   ├── rag_cache/              # Vector index + lemma cache
-│   └── __pycache__/            # Python bytecode cache
+├── bot/ # Main bot application (entry point, core logic)
+│ ├── main.py # Entry point: init, load index, launch Discord bot
+│ ├── config.py # Global settings and constants
+│ ├── rerank.py # CrossEncoder reranking logic
+│ ├── requirements.txt # Python dependencies (active version)
+│ ├── requirements-backup.txt # Backup dependency list (pip freeze)
+│ ├── rag_cache/ # Vector index + lemma cache
+│ └── pycache/ # Python bytecode cache
 │
-├── parsed/                    # Input text/markdown documents for knowledge base
-├── logs/                      # Rotating log files (runtime/debug output)
-├── parsers/                   # Optional data parsers / preprocessors (WIP)
+├── parsed/ # Input text/markdown documents for knowledge base
+├── logs/ # Rotating log files (runtime/debug output)
+├── parsers/ # Optional data parsers / preprocessors (WIP)
 │
-├── system_prompt_reason.txt   # System prompt for reasoning / verbose QA mode
-├── system_prompt_strict.txt   # System prompt for strict factual QA
-├── rephrase.txt               # Prompt for question rewriting (optional)
+├── system_prompt_reason.txt # System prompt for reasoning / verbose QA mode
+├── system_prompt_strict.txt # System prompt for strict factual QA
+├── rephrase.txt # Prompt for question rewriting (optional)
 │
-├── .env                       # Environment variables (API keys etc.)
-├── .env-example               # Example env file for configuration
-├── .gitignore                 # Git exclusion rules
-└── README.md                  # Project documentation
-
-```
-
+├── .env # Environment variables (API keys etc.)
+├── .env-example # Example env file for configuration
+├── .gitignore # Git exclusion rules
+└── README.md # Project documentation
 ---
-
+```
 ## 🧪 QA & Observability
 
 - Full trace logs (per block, per retrieval step)
@@ -134,63 +170,58 @@ If OpenRouter is unavailable (e.g., quota exceeded or downtime), it falls back t
 [INFO ] OpenRouter response successfully received
 ```
 
----
+📢 Discord Commands
+!strict <question> — standard RAG reply with rerank
 
-## 📢 Discord Commands
+!local <question> — local LLM-only answer
 
-- `!strict <вопрос>` — standard RAG reply with rerank  
-- `!local <вопрос>` — local LLM-only answer  
-- `!think <вопрос>` — alternate prompt mode  
-- `!reload_index` — admin-only index rebuild  
-- `!status` — debug/info panel  
-- `!stop` — admin-only shutdown
+!think <question> — alternate prompt mode
 
----
+!reload_index — admin-only index rebuild
 
-## 🛠️ Setup
+!status — debug/info panel
 
-1. **Clone the repo**  
-    ```sh
-    git clone https://github.com/youruser/amc-rag-bot.git
-    cd amc-rag-bot
-    ```
+!stop — admin-only shutdown
 
-2. **Install dependencies**  
-    ```sh
-    pip install -r requirements.txt
-    python -m spacy download en_core_web_sm
-    python -m stanza.download ru
-    ```
+!multy <question> — multistep decomposed retrieval pipeline (for complex queries)
 
-3. **Add API keys**  
-    ```ini
-    DISCORD_TOKEN=...
-    OPENROUTER_API_KEY=...
-    ```
+🛠️ Setup
+Clone the repo
+```text
+git clone https://github.com/youruser/amc-rag-bot.git
+cd amc-rag-bot
+```
+Install dependencies
+```text
+pip install -r requirements.txt
+python -m spacy download en_core_web_sm
+python -m stanza.download ru
+```
+Add API keys
+```text
+DISCORD_TOKEN=...
+OPENROUTER_API_KEY=...
+```
+Place your knowledge base into /parsed/
 
-4. **Place your knowledge base** into `/parsed/`
+Run the bot
+```text
+python main.py
+```
+⚡ Why This Matters
+This project shows how an LLM QA Engineer or RAG Architect can:
 
-5. **Run the bot**  
-    ```sh
-    python main.py
-    ```
+Build a working hybrid retrieval system
 
----
+Handle edge cases, multilingual input, and fallback routing
 
-## ⚡ Why This Matters
+Deploy a real-time QA bot using only Python and open APIs
 
-This project shows how an **LLM QA Engineer** or **RAG Architect** can:
-
-- Build a working hybrid retrieval system
-- Handle edge cases, multilingual input, and fallback routing
-- Deploy a real-time QA bot using only Python and open APIs
-- Deliver results under real constraints (2 days, no prior Python background)
+Deliver results under real constraints (2 days, no prior Python background)
 
 Use this repo as a reference, PoC baseline, or technical interview sample.
 
----
-
-## 🛡 License
+🛡 License
 MIT
 
 📬 Contact: asketmc.team+ragbot@gmail.com
