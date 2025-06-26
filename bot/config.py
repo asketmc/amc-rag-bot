@@ -1,9 +1,9 @@
-# config.py — конфигурация для RAG-бота Asketmc
+# config.py — configuration for the RAG bot Asketmc
 from pathlib import Path
 import re
 import asyncio
 
-# ─── Пути ───────────────────────────────────────────────
+# ─── Paths ───────────────────────────────────────────────
 DOCS_PATH   = Path("C:/LLM/parsed")
 CACHE_PATH  = Path("C:/LLM/rag_cache")
 HASH_FILE   = CACHE_PATH / "docs_hash.json"
@@ -11,7 +11,8 @@ LOG_DIR     = Path("C:/LLM/logs")
 PROMPT_STRICT  = "C:/LLM/system_prompt_strict.txt"
 PROMPT_REASON  = "C:/LLM/system_prompt_reason.txt"
 PROMPT_REPHRASE = "C:/LLM/rephrase.txt"
-# ─── Rerank settings ───────────────────────────────────────────────
+
+# ─── Rerank settings ─────────────────────────────────────
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 RERANK_INPUT_K = 18
 RERANK_OUTPUT_K = 9
@@ -19,9 +20,9 @@ BATCH_SIZE = 8
 MAX_LEN = 512
 QUERY_MAX_CHARS = 2048
 EXECUTOR_WORKERS = 2
-RERANKER_DEVICE = "cpu"  # или "cuda"
+RERANKER_DEVICE = "cpu"  # or "cuda"
 
-# ─── Модели и параметры ─────────────────────────────────
+# ─── Models and parameters ───────────────────────────────
 TOP_K        = 24
 MIN_SCORE    = 0.35
 OR_MODEL     = "deepseek/deepseek-chat:free"
@@ -35,18 +36,20 @@ CHUNK_OVERLAP = 128
 LEMMA_MATCH_RATIO = 0.2
 SCORE_RELATIVE_THRESHOLD = 0.15
 DEBUG = True
+
 GOOD_POS = {
-    "NOUN",   # существительные
-    "ADJF",   # прилагательные (полные)
-    "ADJS",   # прилагательные (краткие)
-    "VERB",   # глаголы
-    "INFN",   # инфинитивы
-    "PRTF",   # причастия
-    "GRND",   # деепричастия
-    "NUMR",   # числительные
+    "NOUN",   # nouns
+    "ADJF",   # full adjectives
+    "ADJS",   # short adjectives
+    "VERB",   # verbs
+    "INFN",   # infinitives
+    "PRTF",   # participles
+    "GRND",   # gerunds
+    "NUMR",   # numerals
 }
+
 STOP_WORDS = {
-    # ─────────────────────────── местоимения (личные, указательные, неопред., отриц.)
+    # ──────────────── pronouns (personal, demonstrative, indefinite, negative)
     "я", "ты", "он", "она", "оно", "мы", "вы", "они",
     "мой", "твой", "его", "её", "наш", "ваш", "их", "свой",
     "меня", "тебя", "него", "неё", "нас", "вас", "них",
@@ -57,66 +60,66 @@ STOP_WORDS = {
     "кто-то", "что-то", "кто-нибудь", "что-нибудь",
     "кто-либо", "что-либо",
 
-    # ─────────────────────────── предлоги
+    # ──────────────── prepositions
     "в", "во", "на", "за", "к", "ко", "с", "со", "от", "перед",
     "при", "об", "обо", "по", "до", "из", "иза", "без", "для",
     "над", "под", "между", "около", "через", "про", "среди",
     "из-за", "из-под", "внутри", "вне", "после", "перед", "согласно",
 
-    # ─────────────────────────── союзы
+    # ──────────────── conjunctions
     "и", "а", "но", "да", "или", "либо", "тоже", "также",
     "что", "чтобы", "если", "когда", "пока", "хотя", "потому",
     "поскольку", "так как", "раз", "как", "будто",
 
-    # ─────────────────────────── частицы
+    # ──────────────── particles
     "ли", "бы", "же", "ведь", "разве", "уж", "то", "де",
     "даже", "вон", "вот", "лишь", "только", "именно", "как-раз",
     "чуть-ли", "едва-ли",
 
-    # ─────────────────────────── вводные / модальные слова
+    # ──────────────── parenthetical/modal words
     "можно", "нельзя", "нужно", "надо", "следует", "должно",
     "может", "наверное", "возможно", "пожалуй", "кажется",
     "видимо", "якобы", "будто", "типа",
 
-    # ─────────────────────────── глаголы-связки и вспомогательные
+    # ──────────────── copulas and auxiliaries
     "быть", "есть", "нет",
     "являться", "являться", "явился",
     "становиться", "стать", "стать",
     "бывать", "оказаться", "оказаться",
     "мочь", "смочь",
 
-    # ─────────────────────────── служебные глаголы-«пустышки»
+    # ──────────────── dummy verbs
     "делать", "сделать", "делаться", "сказать", "говорить",
     "думать", "хотеть", "хотеться", "получаться",
 
-    # ─────────────────────────── вопросительные/уточняющие
+    # ──────────────── interrogative/refining
     "где", "куда", "откуда", "зачем", "почему",
     "когда", "сколько", "как", "каков",
 
-    # ─────────────────────────── абстракт-общие существительные
+    # ──────────────── abstract/general nouns
     "дело", "ситуация", "случай", "момент", "период", "процесс",
     "способ", "метод", "вариант", "часть",
     "раз", "два", "три", "несколько", "много",
 
-    # ─────────────────────────── междометия / реплики
+    # ──────────────── interjections / phrases
     "да", "нет", "ага", "угу", "ох", "ах", "ой", "эй", "эх",
     "ладно", "ок", "ну", "блин", "чёрт", "тьфу",
     "спасибо", "пожалуйста", "извините", "простите",
     "здравствуй", "привет", "пока",
 
-    # ─────────────────────────── технический шум (чат-контекст)
+    # ──────────────── technical chat noise
     "сорри", "имхо", "лол", "кек", "хех",
 }
 
-# ─── Runtime-константы (используются в main.py и rag_multistage) ───────────────
+# ─── Runtime constants (used in main.py and rag_multistage) ───────────────
 import logging
 
 log = logging.getLogger("asketmc.config")
 
 def get_conf(name: str, default, typ=None):
     """
-    Позволяет переопределить значение переменной из config.py через окружение
-    или использовать дефолт. Тип можно указать для безопасного преобразования.
+    Allows overriding config.py variables via environment or uses default.
+    Type can be specified for safe casting.
     """
     try:
         val = globals().get(name, default)
@@ -124,24 +127,24 @@ def get_conf(name: str, default, typ=None):
             val = typ(val)
         return val
     except Exception as e:
-        log.warning("[config.get_conf] Ошибка получения %s: %s", name, e)
+        log.warning("[config.get_conf] Error retrieving %s: %s", name, e)
         return default
 
-# ─── Runtime-константы (жёстко зафиксированы, не берутся из .env) ───────────────
-OR_RETRIES        = 1          # Число попыток для OpenRouter
-CTX_LEN_REMOTE    = 12_000     # Максимальный контекст при использовании OpenRouter
-CTX_LEN_LOCAL     = 20_000     # Максимальный контекст при локальном ответе
-USER_LAST_CLEAN   = 3600       # Интервал очистки user_last (сек)
-EMBED_LOG_EVERY   = 1000       # Каждое N-встраивание логгировать
-LEMMA_CACHE_SIZE  = 200_000    # Размер кэша для лемматизации
-
+# ─── Runtime constants (hardcoded, not loaded from .env) ───────────────
+OR_RETRIES        = 1          # Retry count for OpenRouter
+CTX_LEN_REMOTE    = 12_000     # Max context length when using OpenRouter
+CTX_LEN_LOCAL     = 20_000     # Max context length for local model
+USER_LAST_CLEAN   = 3600       # Cleanup interval for user_last (in seconds)
+EMBED_LOG_EVERY   = 1000       # Log every N embeddings
+LEMMA_CACHE_SIZE  = 200_000    # Lemmatization cache size
 
 # ─── Discord ────────────────────────────────────────────
-ALLOWED_CHANNELS  = {1384890201544982568}  # замените ID на ваш канал
-MAX_QUESTION_LEN  = 300
-USER_COOLDOWN     = 10  # сек
+ALLOWED_CHANNELS  = {1384890201544982568}  # Replace with your channel ID
+MAX_QUESTION_LEN  = 500
+USER_COOLDOWN     = 10  # sec
 REQUEST_SEMAPHORE = asyncio.Semaphore(3)
-ALLOWED_CHARS = re.compile(r"^[ а-яА-ЯёЁa-zA-Z0-9,.?!()\-]+$")
-HTTP_CONN_LIMIT = 5  # 10 для нагрузки
-# ─── Права администраторов ─────────────────────────────
-ADMIN_IDS = {267614224631463937}  # Discord-ID пользователей, которым разрешено !reload_index
+ALLOWED_CHARS = re.compile(r"^[ а-яА-ЯёЁa-zA-Z0-9,.?!()\-—]+$")
+HTTP_CONN_LIMIT = 5  # 10 under load
+
+# ─── Administrator permissions ──────────────────────────
+ADMIN_IDS = {267614224631463937}  # Put your admin Discord ID here. Discord user IDs allowed to run !reload_index
