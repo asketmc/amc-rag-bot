@@ -1,12 +1,12 @@
 #!/usr/bin/env python3.10
 """
-rerank.py – production-ready версия
-Все параметры берутся из config.py.
-CPU/GPU-переключатель, потокобезопасная инициализация,
-ограниченный ThreadPoolExecutor, safetensors-загрузка,
-явное освобождение ресурсов и защита от гонок.
-Любая ошибка инференса или инициализации приводит к возврату пустого списка (fail-safe).
-В режиме DEBUG максимальное логгирование всех стадий rerank.
+rerank.py – production-ready version
+All parameters are taken from config.py.
+CPU/GPU switch, thread-safe initialization,
+limited ThreadPoolExecutor, safetensors loading,
+explicit resource release and race condition protection.
+Any inference or initialization error returns an empty list (fail-safe).
+In DEBUG mode, maximum logging at all rerank stages.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from llama_index.core.schema import NodeWithScore
 import config as cfg
 
 # ──────────────────────────────────────────────────────────
-# Диагностика версии sentence-transformers/CrossEncoder
+# sentence-transformers/CrossEncoder diagnostics
 # ──────────────────────────────────────────────────────────
 print("sentence_transformers version:", sentence_transformers.__version__)
 print("CrossEncoder imported from:", CrossEncoder.__module__)
@@ -35,10 +35,10 @@ print("CrossEncoder imported from:", CrossEncoder.__module__)
 cross_sig = inspect.signature(CrossEncoder.__init__)
 print("CrossEncoder __init__ signature:", cross_sig)
 if "trust_remote_code" not in cross_sig.parameters:
-    print("WARNING: CrossEncoder не поддерживает trust_remote_code! Возможен конфликт пакетов или устаревшая версия.")
+    print("WARNING: CrossEncoder does not support trust_remote_code! Possible package conflict or outdated version.")
 
 # ──────────────────────────────────────────────────────────
-# Настройка логирования
+# Logging configuration
 # ──────────────────────────────────────────────────────────
 log = logging.getLogger("asketmc.rerank")
 log.setLevel(logging.DEBUG if getattr(cfg, "DEBUG", False) else logging.INFO)
@@ -47,36 +47,36 @@ if not log.handlers:
     h.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(name)s: %(message)s"))
     log.addHandler(h)
 
-log.info("[INIT] rerank.py стартует, torch.cuda: %s", torch.cuda.is_available())
-log.info("[INIT] CrossEncoder из: %s", CrossEncoder.__module__)
-log.info("[INIT] CrossEncoder сигнатура: %s", cross_sig)
+log.info("[INIT] rerank.py starting, torch.cuda: %s", torch.cuda.is_available())
+log.info("[INIT] CrossEncoder from: %s", CrossEncoder.__module__)
+log.info("[INIT] CrossEncoder signature: %s", cross_sig)
 
 # ──────────────────────────────────────────────────────────
-# Глобальные объекты
+# Global objects
 # ──────────────────────────────────────────────────────────
 _reranker: Optional[CrossEncoder] = None
 _executor: Optional[ThreadPoolExecutor] = None
 _init_lock = asyncio.Lock()
 
-log.debug("[GLOBAL] Инициализированы глобальные объекты: _reranker=None, _executor=None, _init_lock создан.")
+log.debug("[GLOBAL] Global objects initialized: _reranker=None, _executor=None, _init_lock created.")
 
 def log_global_state(note: str = ""):
     log.info("[GLOBAL STATE] %s _reranker=%r _executor=%r _init_lock=%r",
              note, _reranker, _executor, _init_lock)
 
-log_global_state("После объявления")
+log_global_state("After declaration")
 
 # ──────────────────────────────────────────────────────────
-# Типизация для node.get_content / node.text
+# Typing for node.get_content / node.text
 # ──────────────────────────────────────────────────────────
 class NodeLike(Protocol):
     def get_content(self) -> str: ...
     text: str
 
 # ──────────────────────────────────────────────────────────
-# Глобальные объекты и thread/async safety
+# Global objects and thread/async safety
 # ──────────────────────────────────────────────────────────
-log.debug("[GLOBAL] Инициализированы глобальные объекты: _reranker=None, _executor=None, _init_lock создан (id=%s).", id(_init_lock))
+log.debug("[GLOBAL] Global objects initialized: _reranker=None, _executor=None, _init_lock created (id=%s).", id(_init_lock))
 
 def log_global_state(note: str = ""):
     log.info(
@@ -93,26 +93,21 @@ def log_global_state(note: str = ""):
         type(_init_lock).__name__,
     )
 
-log_global_state("После объявления")
+log_global_state("After declaration")
 
-# Для контроля очистки/инициализации
+# For controlling cleanup/initialization
 def reset_globals():
     global _reranker, _executor
-    log.info("[RESET] Сброс глобальных объектов reranker/executor")
+    log.info("[RESET] Resetting global objects reranker/executor")
     _reranker = None
     if _executor:
         _executor.shutdown(wait=True)
-        log.info("[RESET] Executor shutdown завершён")
+        log.info("[RESET] Executor shutdown complete")
         _executor = None
-    log_global_state("После reset_globals()")
-
-# Вызов этого метода можно логировать везде при init/shutdown:
-# reset_globals()
-# log_global_state("Перед инициализацией CrossEncoder")
-# log_global_state("После инициализации CrossEncoder")
+    log_global_state("After reset_globals()")
 
 # ──────────────────────────────────────────────────────────
-# Вспомогательные функции и потокобезопасный reranker с расширенным логированием
+# Utility functions and thread-safe reranker with extended logging
 # ──────────────────────────────────────────────────────────
 
 def _choose_device() -> str:
@@ -123,17 +118,17 @@ def _choose_device() -> str:
         log.debug("[_choose_device] torch.cuda.is_available() = %s", cuda_ok)
         if cuda_ok:
             return "cuda"
-        log.error("[_choose_device] RERANKER_DEVICE='cuda', но GPU недоступен.")
-        raise RuntimeError("RERANKER_DEVICE='cuda', но GPU недоступен.")
+        log.error("[_choose_device] RERANKER_DEVICE='cuda', but GPU is unavailable.")
+        raise RuntimeError("RERANKER_DEVICE='cuda', but GPU is unavailable.")
     if device != "cpu":
-        log.error("[_choose_device] Некорректный RERANKER_DEVICE=%r", device)
-        raise ValueError("RERANKER_DEVICE должен быть 'cpu' или 'cuda'.")
+        log.error("[_choose_device] Invalid RERANKER_DEVICE=%r", device)
+        raise ValueError("RERANKER_DEVICE must be 'cpu' or 'cuda'.")
     return "cpu"
 
 async def init_reranker(force: bool = False) -> None:
     """
-    Потокобезопасная инициализация CrossEncoder.
-    Устанавливает reranker и пул потоков. При `force=True` перезапускает.
+    Thread-safe CrossEncoder initialization.
+    Sets up reranker and thread pool. Restarts if `force=True`.
     """
     global _reranker, _executor
     async with _init_lock:
@@ -145,29 +140,29 @@ async def init_reranker(force: bool = False) -> None:
             force, model_name, max_len, workers
         )
         if _reranker is not None and not force:
-            log.info("[init_reranker] Уже инициализирован, force=False, пропуск.")
+            log.info("[init_reranker] Already initialized, force=False, skipping.")
             return
         try:
             if _executor:
-                log.info("[init_reranker] Завершаю предыдущий executor...")
+                log.info("[init_reranker] Shutting down previous executor...")
                 _executor.shutdown(wait=False)
                 _executor = None
             if _reranker:
                 if torch.cuda.is_available():
                     mem_before = torch.cuda.memory_allocated()
-                log.info("[init_reranker] Удаляю предыдущий reranker...")
+                log.info("[init_reranker] Deleting previous reranker...")
                 del _reranker
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     mem_after = torch.cuda.memory_allocated()
                     log.info(
-                        "[init_reranker] CUDA память очищена: было %.2f MB, стало %.2f MB",
+                        "[init_reranker] CUDA memory cleared: was %.2f MB, now %.2f MB",
                         mem_before / (1024 ** 2), mem_after / (1024 ** 2)
                     )
                 _reranker = None
             device = _choose_device()
             log.info(
-                "[init_reranker] Создаю CrossEncoder на устройстве %r, модель: %s, max_len=%d",
+                "[init_reranker] Creating CrossEncoder on device %r, model: %s, max_len=%d",
                 device, model_name, max_len
             )
             _reranker = CrossEncoder(
@@ -177,46 +172,46 @@ async def init_reranker(force: bool = False) -> None:
             )
             _executor = ThreadPoolExecutor(max_workers=workers)
             log.info(
-                "[init_reranker] CrossEncoder '%s' (id=%r) загружен на %r, max_len=%d, workers=%d.",
+                "[init_reranker] CrossEncoder '%s' (id=%r) loaded on %r, max_len=%d, workers=%d.",
                 model_name, id(_reranker), device, max_len, workers
             )
         except Exception as ex:
-            log.exception("[init_reranker] Ошибка инициализации CrossEncoder: %s", ex)
+            log.exception("[init_reranker] CrossEncoder initialization error: %s", ex)
             raise
 
 async def shutdown_reranker() -> None:
     """
-    Освобождает пул потоков и GPU-память.
+    Releases thread pool and GPU memory.
     """
     global _reranker, _executor
     async with _init_lock:
-        log.info("[shutdown_reranker] вызван.")
+        log.info("[shutdown_reranker] called.")
         try:
             if _executor:
-                log.info("[shutdown_reranker] Завершаю executor...")
+                log.info("[shutdown_reranker] Shutting down executor...")
                 _executor.shutdown(wait=False)
                 _executor = None
             if _reranker:
                 if torch.cuda.is_available():
                     mem_before = torch.cuda.memory_allocated()
-                log.info("[shutdown_reranker] Удаляю reranker...")
+                log.info("[shutdown_reranker] Deleting reranker...")
                 del _reranker
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     mem_after = torch.cuda.memory_allocated()
                     log.info(
-                        "[shutdown_reranker] CUDA память очищена: было %.2f MB, стало %.2f MB",
+                        "[shutdown_reranker] CUDA memory cleared: was %.2f MB, now %.2f MB",
                         mem_before / (1024 ** 2), mem_after / (1024 ** 2)
                     )
                 _reranker = None
-            log.info("[shutdown_reranker] Реранкер и executor успешно выгружены.")
+            log.info("[shutdown_reranker] Reranker and executor successfully released.")
         except Exception as ex:
-            log.exception("[shutdown_reranker] Ошибка при освобождении ресурсов: %s", ex)
+            log.exception("[shutdown_reranker] Resource release error: %s", ex)
 
 def _filter_pairs(query: str, nodes: List[NodeWithScore]) -> Tuple[List[List[str]], List[NodeWithScore]]:
     """
-    Обрезает список кандидатов и формирует пары (query, document),
-    пропуская пустые документы.
+    Trims candidate list and forms (query, document) pairs,
+    skipping empty documents.
     """
     cand_nodes: List[NodeWithScore] = nodes[:getattr(cfg, "RERANK_INPUT_K", 20)]
     pairs: List[List[str]] = []
@@ -238,7 +233,7 @@ def _filter_pairs(query: str, nodes: List[NodeWithScore]) -> Tuple[List[List[str
             pairs.append([query, content])
             filtered_nodes.append(n)
 
-    log.debug("[_filter_pairs] отобрано %d / %d кандидатов", len(filtered_nodes), len(cand_nodes))
+    log.debug("[_filter_pairs] selected %d / %d candidates", len(filtered_nodes), len(cand_nodes))
     return pairs, filtered_nodes
 
 async def rerank(
@@ -246,10 +241,10 @@ async def rerank(
     nodes: List[NodeWithScore],
 ) -> List[NodeWithScore]:
     """
-    CPU/GPU-агностичный reranker top-k узлов.
-    Возвращает список из cfg.RERANK_OUTPUT_K лучших элементов.
-    В случае любой ошибки возвращает пустой список.
-    Расширенное логирование: имя модели, batch_size, top_k, sample запроса и документа.
+    Hardware-agnostic (CPU/GPU) reranker for top-k nodes.
+    Returns the top cfg.RERANK_OUTPUT_K elements.
+    Any error yields an empty list.
+    Extended logging: model name, batch_size, top_k, sample of query and document.
     """
     global _reranker, _executor
     model_name = getattr(cfg, "RERANKER_MODEL_NAME", "BAAI/bge-reranker-large")
@@ -262,23 +257,23 @@ async def rerank(
         len(query), len(nodes), model_name, max_len, input_k, output_k, batch_size
     )
     if _reranker is None or _executor is None:
-        log.warning("[rerank] Реранкер не инициализирован — пробую инициализировать.")
+        log.warning("[rerank] Reranker not initialized — attempting initialization.")
         try:
             await init_reranker()
         except Exception as ex:
-            log.error("[rerank] Инициализация reranker не удалась: %s", ex)
+            log.error("[rerank] Reranker initialization failed: %s", ex)
             return []
     if not nodes:
-        log.debug("[rerank] нет входных узлов, возвращаю пустой список")
+        log.debug("[rerank] No input nodes, returning empty list")
         return []
     if len(query) > getattr(cfg, "QUERY_MAX_CHARS", 2048):
-        log.warning("[rerank] Запрос превышает лимит %d символов.", getattr(cfg, "QUERY_MAX_CHARS", 2048))
-        raise ValueError(f"query превышает {getattr(cfg, 'QUERY_MAX_CHARS', 2048)} символов")
+        log.warning("[rerank] Query exceeds %d character limit.", getattr(cfg, "QUERY_MAX_CHARS", 2048))
+        raise ValueError(f"query exceeds {getattr(cfg, 'QUERY_MAX_CHARS', 2048)} characters")
     pairs, valid_nodes = _filter_pairs(query, nodes)
     if not pairs:
-        # Логируем вход и sample docs
+        # Log input and sample docs
         log.warning(
-            "[rerank] после фильтрации нет пар. query=%r, sample_node_ids=%r",
+            "[rerank] no pairs after filtering. query=%r, sample_node_ids=%r",
             query[:120], [getattr(n.node, "id", "n/a") for n in nodes[:3]]
         )
         for idx, n in enumerate(nodes[:3]):
@@ -286,7 +281,7 @@ async def rerank(
                 sample_content = n.node.get_content()
             else:
                 sample_content = str(n.node)
-            log.debug("[rerank] Пустой doc idx=%d id=%r sample=%r", idx, getattr(n.node, "id", "n/a"), sample_content[:100])
+            log.debug("[rerank] Empty doc idx=%d id=%r sample=%r", idx, getattr(n.node, "id", "n/a"), sample_content[:100])
         return []
 
     loop = asyncio.get_running_loop()
@@ -295,7 +290,7 @@ async def rerank(
         t0 = time.perf_counter()
         try:
             log.info(
-                "[_predict] Модель: %s | input_k=%d | batch_size=%d | valid_nodes=%d",
+                "[_predict] Model: %s | input_k=%d | batch_size=%d | valid_nodes=%d",
                 model_name, input_k, batch_size, len(valid_nodes)
             )
             scores = _reranker.predict(
@@ -306,13 +301,13 @@ async def rerank(
             )
             dt = time.perf_counter() - t0
             log.info(
-                "[_predict] Rerank completed in %.3f sec for %d items, модель: %s (id=%r)",
+                "[_predict] Rerank completed in %.3f sec for %d items, model: %s (id=%r)",
                 dt, len(pairs), model_name, id(_reranker)
             )
             log.debug("[_predict] scores=%r", scores)
             return scores
         except Exception as ex:
-            log.exception("[_predict] Ошибка инференса CrossEncoder: %s", ex)
+            log.exception("[_predict] CrossEncoder inference error: %s", ex)
             raise
 
     try:
@@ -340,9 +335,9 @@ async def rerank(
     )
 
     if not ranked:
-        # Если вдруг всё равно пусто, логируем вход, конфиг и sample
+        # If still empty, log input, config, and sample
         log.warning(
-            "[rerank] Пустой результат ранжирования. query=%r, model=%s, batch_size=%d, top_k=%d",
+            "[rerank] Empty ranking result. query=%r, model=%s, batch_size=%d, top_k=%d",
             query[:120], model_name, batch_size, output_k
         )
         for idx, n in enumerate(nodes[:3]):
