@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asketmc-bot"
+version = "0.1.0"
+description = "RAG Discord bot"
+requires-python = ">=3.10"
+dependencies = []
+readme = "README.md"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["asketmc_bot"]
+include-package-data = true
+
+[project.scripts]
+asketmc-bot = "asketmc_bot.main:cli"

@@ -78,32 +78,36 @@ Benefits: high recall, per-facet relevance, coherent final grounding, reduced ha
 
 ```text
 LLM/
-├── bot/
-│   ├── main.py                       # async entry, DI wiring, lifecycle
-│   ├── discord_bot.py                # command handlers, RBAC, cooldowns
-│   ├── config.py                     # constants, tunables, paths
-│   ├── index_builder.py              # vector index build/cache/load
-│   ├── rag_filter.py                 # hybrid keyword + semantic filtering
-│   ├── rerank.py                     # CrossEncoder init and scoring
-│   ├── lemma.py                      # RU/EN lemmatization (thread pool)
-│   ├── rag_langchain.py              # optional LC-based experimental pipeline
-│   ├── rag_cache/                    # cache artifacts
-│   ├── __pycache__/
-│   ├── requirements.txt              # active deps
-│   ├── requirements-backup.txt       # frozen backup (pip freeze)
-│   └── tests/                        # optional test modules
-├── parsed/                           # knowledge base sources (md/txt)
-├── parsers/                          # optional preprocessors
-├── logs/                             # rotating logs (app, error, rerank, embed)
-├── rag_cache/                        # root-level cache (legacy/backup)
-├── system_prompt_reason.txt
-├── system_prompt_strict.txt
-├── rephrase.txt
-├── .env                               # secrets (DISCORD_TOKEN, OPENROUTER_API_KEY,…)
-├── .env-example
-├── .gitignore
-├── README.md
-└── LICENSE
+├─ .env                       # canonical env (DISCORD_TOKEN, OPENROUTER_API_KEY, …)
+├─ .env-example               # non-secret sample
+├─ .gitignore
+├─ pyproject.toml             # src-layout packaging (askemc-bot)
+├─ README.md
+├─ requirements.txt
+├─ requirements-dev.txt
+├─ requirements-backup.txt
+├─ data/                      # input data (immutable / versioned)
+│  ├─ parsed/                 # KB sources (md/txt)
+│  └─ parsers/                # offline preprocessors
+├─ src/
+│  └─ asketmc_bot/            # Python package (import: asketmc_bot.*)
+│     ├─ __init__.py
+│     ├─ config.py            # paths, tunables (uses VAR_ROOT/DATA_ROOT)
+│     ├─ main.py              # async entrypoint, DI, lifecycle, .env loader
+│     ├─ discord_bot.py       # commands, RBAC, cooldowns
+│     ├─ index_builder.py     # vector index build/cache/load
+│     ├─ rag_filter.py        # hybrid keyword + semantic filtering
+│     ├─ rerank.py            # CrossEncoder init & scoring
+│     ├─ lemma.py             # RU/EN lemmatization (thread pool)
+│     ├─ rag_langchain.py     # optional LC pipeline (experimental)
+│     ├─ data/                # (optional) package-local resources
+│     └─ rag_cache/           # (temporary; prefer var/rag_cache in prod)
+├─ tests/                     # test suite (pytest)
+│  ├─ test_entrypoint.py      # smoke: docstring + entry guard
+│  └─ test_query_model_unit.py# unit: query_model + circuit breaker
+└─ var/                       # mutable runtime artifacts (not versioned)
+   ├─ logs/                   # rotating logs (app/error/rag/…)
+   └─ rag_cache/              # indices/cache (runtime)
 ```
 
 ---

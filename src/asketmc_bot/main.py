@@ -101,12 +101,34 @@ log = logging.getLogger("asketmc.app")
 embed_log = logging.getLogger("asketmc.embed")
 rag_log = logging.getLogger("asketmc.rag")
 
-# Load .env from the module directory or its parent (first match wins).
-for candidate in (Path(__file__).parent / ".env", Path(__file__).parent.parent / ".env"):
-    if candidate.exists():
-        load_dotenv(candidate)
-        break
+# ──────────────────────────────────────────────────────────────────────────────
+# Environment configuration (.env loading)
+# ──────────────────────────────────────────────────────────────────────────────
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 
+# Determine the absolute project root (.../LLM)
+ROOT = Path(__file__).resolve().parents[2]
+
+# Optional explicit override via environment variable
+explicit = os.getenv("ASKETMC_DOTENV")
+
+# Load order (first match wins):
+#   1. Explicit path via ASKETMC_DOTENV (highest priority)
+#   2. LLM/.env.local  – developer overrides (never used in CI/Prod)
+#   3. LLM/.env        – canonical project configuration
+candidates = [
+    Path(explicit) if explicit else None,
+    ROOT / ".env.local",
+    ROOT / ".env",
+]
+
+for env_path in candidates:
+    if env_path and env_path.exists():
+        # override=False ensures system/CI variables take precedence.
+        load_dotenv(env_path, override=False)
+        break
 
 @dataclass(frozen=True)
 class Settings:
