@@ -115,29 +115,36 @@ If OpenRouter is unavailable (e.g., quota exceeded or downtime), it falls back t
 
 ## 📁 File Layout
 ```text
-/LLM
-├── bot/ # Main bot application (entry point, core logic)
-│ ├── main.py # Entry point: init, load index, launch Discord bot
-│ ├── config.py # Global settings and constants
-│ ├── rerank.py # CrossEncoder reranking logic
-│ ├── requirements.txt # Python dependencies (active version)
-│ ├── requirements-backup.txt # Backup dependency list (pip freeze)
-│ ├── rag_cache/ # Vector index + lemma cache
-│ └── pycache/ # Python bytecode cache
+LLM/
+├── bot/                               # Core application package
+│   ├── main.py                        # Core entry point — initializes, injects dependencies, starts Discord bot
+│   ├── discord_bot.py                 # Discord bot module (commands, lifecycle, async runtime)
+│   ├── config.py                      # Global configuration (paths, constants, runtime parameters)
+│   ├── index_builder.py               # Vector index build / cache / load (async)
+│   ├── rag_filter.py                  # Node filtering and context builder (hybrid keyword + semantic)
+│   ├── rerank.py                      # CrossEncoder rerank initialization and lifecycle management
+│   ├── lemma.py                       # Lemmatization logic (Stanza/spaCy/langdetect, thread pool)
+│   ├── rag_langchain.py               # (Optional) LangChain-based experimental RAG pipeline
+│   ├── rag_cache/                     # Cached vector store and lemma/chunk data
+│   ├── __pycache__/                   # Compiled bytecode (auto-generated)
+│   ├── requirements.txt               # Active dependency list
+│   ├── requirements-backup.txt        # Frozen backup dependencies (pip freeze)
+│   └── tests/ (optional)              # Future test modules or PyTest cache
 │
-├── parsed/ # Input text/markdown documents for knowledge base
-├── logs/ # Rotating log files (runtime/debug output)
-├── parsers/ # Optional data parsers / preprocessors (WIP)
+├── parsed/                            # Knowledge base: markdown/text sources used for retrieval
+├── parsers/                           # Data parsers / preprocessors (optional or WIP)
+├── logs/                              # Rotating logs: app.log, error.log, rerank.log, embed.log
+├── rag_cache/                         # Root-level persistent cache (backup or legacy path)
 │
-├── system_prompt_reason.txt # System prompt for reasoning / verbose QA mode
-├── system_prompt_strict.txt # System prompt for strict factual QA
-├── rephrase.txt # Prompt for question rewriting (optional)
+├── system_prompt_reason.txt           # System prompt (reasoning mode)
+├── system_prompt_strict.txt           # System prompt (factual QA mode)
+├── rephrase.txt                       # Optional prompt for question rewriting
 │
-├── .env # Environment variables (API keys etc.)
-├── .env-example # Example env file for configuration
-├── .gitignore # Git exclusion rules
-└── README.md # Project documentation
----
+├── .env                               # Environment variables (DISCORD_TOKEN, OPENROUTER_API_KEY, etc.)
+├── .env-example                       # Example environment configuration
+├── .gitignore                         # Git exclusion rules
+├── README.md                          # Project documentation
+└── LICENSE / notes (optional)         # Licensing or release notes
 ```
 ## 🧪 QA & Observability
 
