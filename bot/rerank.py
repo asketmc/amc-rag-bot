@@ -1,353 +1,348 @@
 #!/usr/bin/env python3.10
-"""
-rerank.py – production-ready version
-All parameters are taken from config.py.
-CPU/GPU switch, thread-safe initialization,
-limited ThreadPoolExecutor, safetensors loading,
-explicit resource release and race condition protection.
-Any inference or initialization error returns an empty list (fail-safe).
-In DEBUG mode, maximum logging at all rerank stages.
+"""Production-grade CrossEncoder reranker (async-safe, CPU/GPU).
+
+Public API:
+    * await init_reranker(force: bool = False) -> None
+    * await shutdown_reranker() -> None
+    * await rerank(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]
+
+Features:
+    - Config-driven with safe defaults (taken from `config`).
+    - Async/thread-safe initialization guarded by an asyncio.Lock.
+    - Bounded ThreadPoolExecutor for CPU-bound inference.
+    - CPU/GPU selection with CUDA availability checks.
+    - Inference timeout and retries.
+    - Strict input validation (regex + max length).
+    - No eval/exec/shell, no unsafe deserialization.
+    - Structured logging; DEBUG is verbose in development.
 """
 
 from __future__ import annotations
 
-import sys
-import logging
-import inspect
-import time
 import asyncio
-from typing import List, Tuple, Protocol, Optional
+import logging
+import re
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional, Tuple
 
 import torch
-import sentence_transformers
-from sentence_transformers import CrossEncoder
 from llama_index.core.schema import NodeWithScore
+from sentence_transformers import CrossEncoder
 
 import config as cfg
 
-# ──────────────────────────────────────────────────────────
-# sentence-transformers/CrossEncoder diagnostics
-# ──────────────────────────────────────────────────────────
-print("sentence_transformers version:", sentence_transformers.__version__)
-print("CrossEncoder imported from:", CrossEncoder.__module__)
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
 
-cross_sig = inspect.signature(CrossEncoder.__init__)
-print("CrossEncoder __init__ signature:", cross_sig)
-if "trust_remote_code" not in cross_sig.parameters:
-    print("WARNING: CrossEncoder does not support trust_remote_code! Possible package conflict or outdated version.")
-
-# ──────────────────────────────────────────────────────────
-# Logging configuration
-# ──────────────────────────────────────────────────────────
-log = logging.getLogger("asketmc.rerank")
-log.setLevel(logging.DEBUG if getattr(cfg, "DEBUG", False) else logging.INFO)
-if not log.handlers:
-    h = logging.StreamHandler(sys.stdout)
-    h.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(name)s: %(message)s"))
-    log.addHandler(h)
-
-log.info("[INIT] rerank.py starting, torch.cuda: %s", torch.cuda.is_available())
-log.info("[INIT] CrossEncoder from: %s", CrossEncoder.__module__)
-log.info("[INIT] CrossEncoder signature: %s", cross_sig)
-
-# ──────────────────────────────────────────────────────────
-# Global objects
-# ──────────────────────────────────────────────────────────
-_reranker: Optional[CrossEncoder] = None
-_executor: Optional[ThreadPoolExecutor] = None
-_init_lock = asyncio.Lock()
-
-log.debug("[GLOBAL] Global objects initialized: _reranker=None, _executor=None, _init_lock created.")
-
-def log_global_state(note: str = ""):
-    log.info("[GLOBAL STATE] %s _reranker=%r _executor=%r _init_lock=%r",
-             note, _reranker, _executor, _init_lock)
-
-log_global_state("After declaration")
-
-# ──────────────────────────────────────────────────────────
-# Typing for node.get_content / node.text
-# ──────────────────────────────────────────────────────────
-class NodeLike(Protocol):
-    def get_content(self) -> str: ...
-    text: str
-
-# ──────────────────────────────────────────────────────────
-# Global objects and thread/async safety
-# ──────────────────────────────────────────────────────────
-log.debug("[GLOBAL] Global objects initialized: _reranker=None, _executor=None, _init_lock created (id=%s).", id(_init_lock))
-
-def log_global_state(note: str = ""):
-    log.info(
-        "[GLOBAL STATE] %s | _reranker: %s (id=%s, type=%s) | _executor: %s (id=%s, type=%s) | _init_lock: id=%s (locked=%s, type=%s)",
-        note,
-        repr(_reranker),
-        id(_reranker),
-        type(_reranker).__name__ if _reranker else None,
-        repr(_executor),
-        id(_executor),
-        type(_executor).__name__ if _executor else None,
-        id(_init_lock),
-        _init_lock.locked(),
-        type(_init_lock).__name__,
+_LOG = logging.getLogger("asketmc.rerank")
+_LOG.setLevel(logging.DEBUG if getattr(cfg, "DEBUG", False) else logging.INFO)
+if not _LOG.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(
+        logging.Formatter("[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
     )
+    _LOG.addHandler(_handler)
 
-log_global_state("After declaration")
+# -----------------------------------------------------------------------------
+# Configuration defaults
+# -----------------------------------------------------------------------------
 
-# For controlling cleanup/initialization
-def reset_globals():
-    global _reranker, _executor
-    log.info("[RESET] Resetting global objects reranker/executor")
-    _reranker = None
-    if _executor:
-        _executor.shutdown(wait=True)
-        log.info("[RESET] Executor shutdown complete")
-        _executor = None
-    log_global_state("After reset_globals()")
+_DEFAULT_ALLOWED_RE = (
+    r"^[\w\s\.\,\:\;\!\?\(\)\-\[\]\{\}'\"/@#%&\*\+\=\<\>\$€£…©®™°|\\`~№"
+    r"А-Яа-яЁё]+$"
+)
+ALLOWED_CHARS_REGEX = getattr(cfg, "ALLOWED_CHARS_REGEX", _DEFAULT_ALLOWED_RE)
+_QUERY_MAX_CHARS = int(getattr(cfg, "QUERY_MAX_CHARS", 2048))
 
-# ──────────────────────────────────────────────────────────
-# Utility functions and thread-safe reranker with extended logging
-# ──────────────────────────────────────────────────────────
+_RERANKER_MODEL_NAME = getattr(cfg, "RERANKER_MODEL_NAME", "BAAI/bge-reranker-large")
+_RERANK_INPUT_K = int(getattr(cfg, "RERANK_INPUT_K", 20))
+_RERANK_OUTPUT_K = int(getattr(cfg, "RERANK_OUTPUT_K", 5))
+_MAX_LEN = int(getattr(cfg, "MAX_LEN", 512))
+_BATCH_SIZE = int(getattr(cfg, "BATCH_SIZE", 16))
+_RERANKER_DEVICE = str(getattr(cfg, "RERANKER_DEVICE", "cpu")).lower()
+_EXECUTOR_WORKERS = int(getattr(cfg, "EXECUTOR_WORKERS", 4))
+_PREDICT_TIMEOUT_SEC = float(getattr(cfg, "PREDICT_TIMEOUT_SEC", 120.0))
+_PREDICT_RETRIES = int(getattr(cfg, "PREDICT_RETRIES", 1))  # 0 means no retries
+
+# -----------------------------------------------------------------------------
+# Globals (lazy-initialized; protected by _INIT_LOCK)
+# -----------------------------------------------------------------------------
+
+_RERANKER: Optional[CrossEncoder] = None
+_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_INIT_LOCK = asyncio.Lock()
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+_ALLOWED_RE = re.compile(ALLOWED_CHARS_REGEX, re.UNICODE)
+
+
+def _sanitize_input(text: str, *, max_len: int = _QUERY_MAX_CHARS) -> str:
+    """Validate and normalize user input."""
+    if not isinstance(text, str):
+        raise ValueError("query must be a string")
+    s = text.strip()
+    if not s:
+        raise ValueError("query is empty")
+    if len(s) > max_len:
+        raise ValueError(f"query exceeds {max_len} characters")
+    if not _ALLOWED_RE.fullmatch(s):
+        raise ValueError("query contains disallowed characters")
+    return s
+
 
 def _choose_device() -> str:
-    device = str(getattr(cfg, "RERANKER_DEVICE", "cpu")).lower()
-    log.debug("[_choose_device] RERANKER_DEVICE=%r", device)
-    if device == "cuda":
-        cuda_ok = torch.cuda.is_available()
-        log.debug("[_choose_device] torch.cuda.is_available() = %s", cuda_ok)
-        if cuda_ok:
+    """Return device string based on config and CUDA availability."""
+    if _RERANKER_DEVICE == "cpu":
+        return "cpu"
+    if _RERANKER_DEVICE == "cuda":
+        if torch.cuda.is_available():
             return "cuda"
-        log.error("[_choose_device] RERANKER_DEVICE='cuda', but GPU is unavailable.")
-        raise RuntimeError("RERANKER_DEVICE='cuda', but GPU is unavailable.")
-    if device != "cpu":
-        log.error("[_choose_device] Invalid RERANKER_DEVICE=%r", device)
-        raise ValueError("RERANKER_DEVICE must be 'cpu' or 'cuda'.")
-    return "cpu"
+        raise RuntimeError("RERANKER_DEVICE='cuda' but CUDA is not available")
+    raise ValueError("RERANKER_DEVICE must be 'cpu' or 'cuda'")
 
-async def init_reranker(force: bool = False) -> None:
-    """
-    Thread-safe CrossEncoder initialization.
-    Sets up reranker and thread pool. Restarts if `force=True`.
-    """
-    global _reranker, _executor
-    async with _init_lock:
-        model_name = getattr(cfg, "RERANKER_MODEL_NAME", "BAAI/bge-reranker-large")
-        max_len = getattr(cfg, "MAX_LEN", 512)
-        workers = getattr(cfg, "EXECUTOR_WORKERS", 4)
-        log.info(
-            "[init_reranker] called with force=%s, model_name=%s, max_len=%d, workers=%d",
-            force, model_name, max_len, workers
-        )
-        if _reranker is not None and not force:
-            log.info("[init_reranker] Already initialized, force=False, skipping.")
-            return
+
+def _node_text(n: NodeWithScore) -> str:
+    """Extract textual content from a NodeWithScore safely."""
+    node = getattr(n, "node", n)
+    if hasattr(node, "get_content"):
         try:
-            if _executor:
-                log.info("[init_reranker] Shutting down previous executor...")
-                _executor.shutdown(wait=False)
-                _executor = None
-            if _reranker:
-                if torch.cuda.is_available():
-                    mem_before = torch.cuda.memory_allocated()
-                log.info("[init_reranker] Deleting previous reranker...")
-                del _reranker
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    mem_after = torch.cuda.memory_allocated()
-                    log.info(
-                        "[init_reranker] CUDA memory cleared: was %.2f MB, now %.2f MB",
-                        mem_before / (1024 ** 2), mem_after / (1024 ** 2)
-                    )
-                _reranker = None
-            device = _choose_device()
-            log.info(
-                "[init_reranker] Creating CrossEncoder on device %r, model: %s, max_len=%d",
-                device, model_name, max_len
-            )
-            _reranker = CrossEncoder(
-                model_name,
-                device=device,
-                max_length=max_len,
-            )
-            _executor = ThreadPoolExecutor(max_workers=workers)
-            log.info(
-                "[init_reranker] CrossEncoder '%s' (id=%r) loaded on %r, max_len=%d, workers=%d.",
-                model_name, id(_reranker), device, max_len, workers
-            )
-        except Exception as ex:
-            log.exception("[init_reranker] CrossEncoder initialization error: %s", ex)
-            raise
+            return node.get_content() or ""
+        except Exception:
+            return ""
+    if hasattr(node, "text"):
+        return getattr(node, "text", "") or ""
+    return ""
 
-async def shutdown_reranker() -> None:
-    """
-    Releases thread pool and GPU memory.
-    """
-    global _reranker, _executor
-    async with _init_lock:
-        log.info("[shutdown_reranker] called.")
-        try:
-            if _executor:
-                log.info("[shutdown_reranker] Shutting down executor...")
-                _executor.shutdown(wait=False)
-                _executor = None
-            if _reranker:
-                if torch.cuda.is_available():
-                    mem_before = torch.cuda.memory_allocated()
-                log.info("[shutdown_reranker] Deleting reranker...")
-                del _reranker
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    mem_after = torch.cuda.memory_allocated()
-                    log.info(
-                        "[shutdown_reranker] CUDA memory cleared: was %.2f MB, now %.2f MB",
-                        mem_before / (1024 ** 2), mem_after / (1024 ** 2)
-                    )
-                _reranker = None
-            log.info("[shutdown_reranker] Reranker and executor successfully released.")
-        except Exception as ex:
-            log.exception("[shutdown_reranker] Resource release error: %s", ex)
 
-def _filter_pairs(query: str, nodes: List[NodeWithScore]) -> Tuple[List[List[str]], List[NodeWithScore]]:
-    """
-    Trims candidate list and forms (query, document) pairs,
-    skipping empty documents.
-    """
-    cand_nodes: List[NodeWithScore] = nodes[:getattr(cfg, "RERANK_INPUT_K", 20)]
+def _filter_pairs(
+    query: str, nodes: List[NodeWithScore]
+) -> Tuple[List[List[str]], List[NodeWithScore]]:
+    """Return (query, doc) pairs and corresponding nodes, skipping empty docs."""
+    cand_nodes: List[NodeWithScore] = nodes[:_RERANK_INPUT_K]
     pairs: List[List[str]] = []
     filtered_nodes: List[NodeWithScore] = []
 
     for idx, n in enumerate(cand_nodes):
-        content = ""
-        if hasattr(n.node, "get_content"):
-            content = n.node.get_content() or ""
-        elif hasattr(n.node, "text"):
-            content = n.node.text or ""
-
-        log.debug(
-            "[_filter_pairs] idx=%d, node_id=%r, content_len=%d, content_sample=%r",
-            idx, getattr(n.node, "id", "n/a"), len(content), content[:50]
-        )
-
+        content = _node_text(n)
         if content.strip():
             pairs.append([query, content])
             filtered_nodes.append(n)
+        else:
+            _LOG.debug(
+                "[_filter_pairs] skip empty doc idx=%d id=%r",
+                idx,
+                getattr(getattr(n, "node", n), "id", "n/a"),
+            )
 
-    log.debug("[_filter_pairs] selected %d / %d candidates", len(filtered_nodes), len(cand_nodes))
+    _LOG.debug(
+        "[_filter_pairs] selected %d/%d candidates",
+        len(filtered_nodes),
+        len(cand_nodes),
+    )
     return pairs, filtered_nodes
 
-async def rerank(
-    query: str,
-    nodes: List[NodeWithScore],
-) -> List[NodeWithScore]:
-    """
-    Hardware-agnostic (CPU/GPU) reranker for top-k nodes.
-    Returns the top cfg.RERANK_OUTPUT_K elements.
-    Any error yields an empty list.
-    Extended logging: model name, batch_size, top_k, sample of query and document.
-    """
-    global _reranker, _executor
-    model_name = getattr(cfg, "RERANKER_MODEL_NAME", "BAAI/bge-reranker-large")
-    max_len = getattr(cfg, "MAX_LEN", 512)
-    input_k = getattr(cfg, "RERANK_INPUT_K", 20)
-    output_k = getattr(cfg, "RERANK_OUTPUT_K", 5)
-    batch_size = getattr(cfg, "BATCH_SIZE", 16)
-    log.debug(
-        "[rerank] query_len=%d nodes=%d model=%s max_len=%d input_k=%d output_k=%d batch_size=%d",
-        len(query), len(nodes), model_name, max_len, input_k, output_k, batch_size
-    )
-    if _reranker is None or _executor is None:
-        log.warning("[rerank] Reranker not initialized — attempting initialization.")
+
+# -----------------------------------------------------------------------------
+# Lifecycle
+# -----------------------------------------------------------------------------
+
+async def init_reranker(force: bool = False) -> None:
+    """Initialize CrossEncoder and thread pool safely; re-init on force=True."""
+    global _RERANKER, _EXECUTOR
+    async with _INIT_LOCK:
+        if _RERANKER is not None and _EXECUTOR is not None and not force:
+            _LOG.info("[init_reranker] already initialized; skip (force=False)")
+            return
+
+        if _EXECUTOR is not None:
+            _LOG.info("[init_reranker] shutting down previous executor")
+            _EXECUTOR.shutdown(wait=True)
+            _EXECUTOR = None
+        if _RERANKER is not None:
+            try:
+                if torch.cuda.is_available():
+                    mem_before = torch.cuda.memory_allocated()
+                del _RERANKER
+                _RERANKER = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    mem_after = torch.cuda.memory_allocated()
+                    _LOG.info(
+                        "[init_reranker] CUDA cache cleared: %.2f -> %.2f MB",
+                        mem_before / (1024 ** 2),
+                        mem_after / (1024 ** 2),
+                    )
+            except Exception as exc:  # pragma: no cover
+                _LOG.warning(
+                    "[init_reranker] error during previous model cleanup: %s", exc
+                )
+
+        device = _choose_device()
+        _LOG.info(
+            "[init_reranker] loading CrossEncoder model=%s device=%s max_length=%d "
+            "workers=%d",
+            _RERANKER_MODEL_NAME,
+            device,
+            _MAX_LEN,
+            _EXECUTOR_WORKERS,
+        )
+        _RERANKER = CrossEncoder(
+            _RERANKER_MODEL_NAME,
+            device=device,
+            max_length=_MAX_LEN,
+        )
+        _EXECUTOR = ThreadPoolExecutor(max_workers=_EXECUTOR_WORKERS)
+        _LOG.info(
+            "[init_reranker] CrossEncoder ready (id=%r) on %s; executor workers=%d",
+            id(_RERANKER),
+            device,
+            _EXECUTOR_WORKERS,
+        )
+
+
+async def shutdown_reranker() -> None:
+    """Release thread pool and GPU memory (if any)."""
+    global _RERANKER, _EXECUTOR
+    async with _INIT_LOCK:
+        _LOG.info("[shutdown_reranker] called")
         try:
-            await init_reranker()
-        except Exception as ex:
-            log.error("[rerank] Reranker initialization failed: %s", ex)
-            return []
+            if _EXECUTOR is not None:
+                _EXECUTOR.shutdown(wait=True)
+                _EXECUTOR = None
+            if _RERANKER is not None:
+                try:
+                    if torch.cuda.is_available():
+                        mem_before = torch.cuda.memory_allocated()
+                    del _RERANKER
+                    _RERANKER = None
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        mem_after = torch.cuda.memory_allocated()
+                        _LOG.info(
+                            "[shutdown_reranker] CUDA cache cleared: %.2f -> %.2f MB",
+                            mem_before / (1024 ** 2),
+                            mem_after / (1024 ** 2),
+                        )
+                except Exception as exc:  # pragma: no cover
+                    _LOG.warning(
+                        "[shutdown_reranker] error during model cleanup: %s", exc
+                    )
+        finally:
+            _LOG.info("[shutdown_reranker] resources released")
+
+
+# -----------------------------------------------------------------------------
+# Rerank
+# -----------------------------------------------------------------------------
+
+async def rerank(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]:
+    """Score candidate nodes with a CrossEncoder and return top-K results.
+
+    Args:
+        query: User query string.
+        nodes: Candidate nodes to rerank.
+
+    Returns:
+        Top `cfg.RERANK_OUTPUT_K` nodes sorted by descending score.
+        Returns an empty list on inference failure.
+
+    Raises:
+        ValueError: If the query violates input policy.
+    """
+    global _RERANKER, _EXECUTOR
+
+    query = _sanitize_input(query, max_len=_QUERY_MAX_CHARS)
+
     if not nodes:
-        log.debug("[rerank] No input nodes, returning empty list")
+        _LOG.debug("[rerank] empty input nodes -> []")
         return []
-    if len(query) > getattr(cfg, "QUERY_MAX_CHARS", 2048):
-        log.warning("[rerank] Query exceeds %d character limit.", getattr(cfg, "QUERY_MAX_CHARS", 2048))
-        raise ValueError(f"query exceeds {getattr(cfg, 'QUERY_MAX_CHARS', 2048)} characters")
+
+    if _RERANKER is None or _EXECUTOR is None:
+        _LOG.info("[rerank] reranker not initialized; attempting init")
+        await init_reranker(force=False)
+        if _RERANKER is None or _EXECUTOR is None:
+            _LOG.error("[rerank] init failed -> []")
+            return []
+
     pairs, valid_nodes = _filter_pairs(query, nodes)
     if not pairs:
-        # Log input and sample docs
-        log.warning(
-            "[rerank] no pairs after filtering. query=%r, sample_node_ids=%r",
-            query[:120], [getattr(n.node, "id", "n/a") for n in nodes[:3]]
-        )
-        for idx, n in enumerate(nodes[:3]):
-            if hasattr(n.node, "get_content"):
-                sample_content = n.node.get_content()
-            else:
-                sample_content = str(n.node)
-            log.debug("[rerank] Empty doc idx=%d id=%r sample=%r", idx, getattr(n.node, "id", "n/a"), sample_content[:100])
+        _LOG.warning("[rerank] no valid documents after filtering -> []")
         return []
 
     loop = asyncio.get_running_loop()
 
-    def _predict() -> List[float]:
+    def _predict_once() -> List[float]:
         t0 = time.perf_counter()
+        scores = _RERANKER.predict(
+            pairs,
+            batch_size=_BATCH_SIZE,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        dt = time.perf_counter() - t0
+        _LOG.info(
+            "[_predict_once] model=%s items=%d batch=%d took=%.3fs",
+            _RERANKER_MODEL_NAME,
+            len(pairs),
+            _BATCH_SIZE,
+            dt,
+        )
         try:
-            log.info(
-                "[_predict] Model: %s | input_k=%d | batch_size=%d | valid_nodes=%d",
-                model_name, input_k, batch_size, len(valid_nodes)
-            )
-            scores = _reranker.predict(
-                pairs,
-                batch_size=batch_size,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            )
-            dt = time.perf_counter() - t0
-            log.info(
-                "[_predict] Rerank completed in %.3f sec for %d items, model: %s (id=%r)",
-                dt, len(pairs), model_name, id(_reranker)
-            )
-            log.debug("[_predict] scores=%r", scores)
-            return scores
-        except Exception as ex:
-            log.exception("[_predict] CrossEncoder inference error: %s", ex)
-            raise
+            return scores.tolist()  # type: ignore[attr-defined]
+        except Exception:
+            return list(scores)
 
-    try:
-        scores: List[float] = await loop.run_in_executor(_executor, _predict)
-    except Exception as ex:
-        log.error("[rerank] Rerank executor failed: %s", ex)
-        return []
+    attempt = 0
+    last_err: Optional[Exception] = None
+    while attempt <= _PREDICT_RETRIES:
+        attempt += 1
+        try:
+            fut = loop.run_in_executor(_EXECUTOR, _predict_once)
+            scores: List[float] = await asyncio.wait_for(
+                fut, timeout=_PREDICT_TIMEOUT_SEC
+            )
+            ranked: List[Tuple[NodeWithScore, float]] = sorted(
+                zip(valid_nodes, scores), key=lambda x: x[1], reverse=True
+            )
+            if not ranked:
+                _LOG.warning("[rerank] empty result after scoring -> []")
+                return []
+            top_k = _RERANK_OUTPUT_K
+            out = [n for n, _ in ranked[:top_k]]
+            _LOG.debug(
+                "[rerank] top%d ids=%s",
+                top_k,
+                [getattr(getattr(n, "node", n), "id", "n/a") for n in out],
+            )
+            return out
+        except asyncio.TimeoutError as exc:
+            last_err = exc
+            _LOG.warning(
+                "[rerank] inference timeout after %.1fs (attempt %d/%d)",
+                _PREDICT_TIMEOUT_SEC,
+                attempt,
+                _PREDICT_RETRIES + 1,
+            )
+        except Exception as exc:
+            last_err = exc
+            _LOG.exception(
+                "[rerank] inference error on attempt %d/%d: %s",
+                attempt,
+                _PREDICT_RETRIES + 1,
+                exc,
+            )
+        if attempt <= _PREDICT_RETRIES:
+            await asyncio.sleep(min(0.25 * attempt, 1.0))
 
-    ranked: List[Tuple[NodeWithScore, float]] = sorted(
-        zip(valid_nodes, scores),
-        key=lambda x: x[1],
-        reverse=True,
+    _LOG.error(
+        "[rerank] giving up after %d attempts -> [] (%s)",
+        _PREDICT_RETRIES + 1,
+        last_err,
     )
-
-    log.debug(
-        "[rerank] ranked_top=[%s]",
-        ", ".join(
-            "(id=%r, score=%.6f, file=%r)" % (
-                getattr(n.node, "id", "n/a"),
-                s,
-                n.node.metadata.get("file_name", "n/a"),
-            )
-            for n, s in ranked[:output_k]
-        )
-    )
-
-    if not ranked:
-        # If still empty, log input, config, and sample
-        log.warning(
-            "[rerank] Empty ranking result. query=%r, model=%s, batch_size=%d, top_k=%d",
-            query[:120], model_name, batch_size, output_k
-        )
-        for idx, n in enumerate(nodes[:3]):
-            if hasattr(n.node, "get_content"):
-                sample_content = n.node.get_content()
-            else:
-                sample_content = str(n.node)
-            log.debug("[rerank] Sample doc idx=%d id=%r sample=%r", idx, getattr(n.node, "id", "n/a"), sample_content[:100])
-        return []
-
-    return [n for n, _ in ranked[:output_k]]
-
-# ──────────────────────────────────────────────────────────
+    return []
