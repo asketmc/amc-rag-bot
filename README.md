@@ -6,222 +6,248 @@
 ![Discord](https://img.shields.io/badge/Discord-Bot-informational)
 ![NLP](https://img.shields.io/badge/NLP-Stanza%20%7C%20spaCy-purple)
 ![Status](https://img.shields.io/badge/status-internal%20use-yellow)
-![Updated](https://img.shields.io/badge/last%20update-June%202025-blueviolet)
+![Updated](https://img.shields.io/badge/last%20update-October%202025-blueviolet)
 
-> Lightweight hybrid-RAG Discord bot (vector + keyword fallback) for Russian-language file-based knowledge bases.  
-> Built in 2 days from scratch (first-time Python) as a demonstration of LLM orchestration, retrieval QA logic, and modular design.
-
----
-
-## ✅ Purpose & Highlights
-
-This project was built **in just 2 days**, with no prior Python experience.  
-It demonstrates how to build a fully functional **Retrieval-Augmented Generation (RAG)** assistant using:
-
-- **Local LLM inference** (Ollama + Llama3)
-- **Hybrid retrieval** via `llama-index` + keyword fallback
-- **Full rerank pipeline** with `CrossEncoder`
-- **Russian-language lemmatization** (Stanza, spaCy)
-- **Secure, async-safe Discord bot** architecture
-
-Originally developed for an RPG Minecraft server, this RAG bot is also designed to support internal tech documentation — e.g., for DevOps/QA teams.  
-It supports structured configs, multilingual corpora, and real-world adaptation (e.g., Salesforce internal docs at Fleetcor).
+> Hybrid-RAG Discord assistant for file-based knowledge bases (RU/EN). Vector retrieval + keyword fallback, CrossEncoder rerank, secure async bot runtime. Designed for reliability, observability, and low-latency local inference.
 
 ---
 
-## 🔍 Key Features
+## ✅ Scope & Value Proposition
 
-- **Hybrid Retrieval**: vector search (BAAI/bge) + keyword fallback with score filtering  
-- **Async-safe rerank**: `BAAI/bge-reranker-v2-m3` with thread pool + CPU/GPU switch  
-- **Lemmatized KB**: Russian+English, SHA256 cache, sentence chunking, per-file indices  
-- **Discord Bot**: role-based access, command parsing, cooldowns, message sanitization  
-- **Fault Tolerance**: automatic fallback to local LLM on OpenRouter errors  
-- **Full Logging**: rotating logs per module (`chat`, `embedding`, `errors`, etc.)  
-- **Configurable**: `.env` + `config.py` + isolated prompt files (`system_prompt.txt`, etc.)  
-- **Flexible Backend**: tested with multiple LLMs, easily switchable via config  
+This repository demonstrates a production-style **Retrieval-Augmented Generation (RAG)** workload with:
 
----
+* **Local inference** via **Ollama + Llama3**
+* **Hybrid retrieval** (`llama-index` + keyword fallback)
+* **Dual-stage reranking** with `CrossEncoder`
+* **Russian/English lemmatization** (Stanza, spaCy)
+* **Hardened Discord bot** (RBAC, cooldowns, sanitization)
 
-## 🧠 Advanced Multistep RAG (`!multy`)
-
-The `!multy` command implements a **multi-question, dual-rerank pipeline** for complex queries — ideal for lore-heavy worlds or layered documentation.
+Primary use cases: internal documentation assistants, QA/dev tooling, knowledge-heavy game worlds.
 
 ---
 
-### ⚙️ How it works
+## 🔍 Feature Highlights
 
-**Step 1:** Decompose original query `Q0` → [`Q1`, `Q2`, `Q3`] via LLM
-
-**Step 2:** For each `Qn`:
-- Retrieve top‑**K** chunks (_default: 18, `config.RERANK_INPUT_K`_)
-- Rerank with `CrossEncoder` (`BAAI/bge-reranker-v2-m3`)
-- Select top‑**R** chunks (_default: 9, `config.RERANK_OUTPUT_K`_) via semantic + lemma-based filtering
-
-**Step 3:** Merge all filtered chunks → `[C1 ... Cn]`
-
-**Step 4:** Final rerank: `Q0` vs `[C1 ... Cn]`
-- Select top‑**F** chunks (_default: 16, `config.TOP_K`_) for context
-
-**Step 5:** Query LLM with:
-- `SYSTEM` prompt  
-- Final `CONTEXT`  
-- Original `QUESTION = Q0`
+* **Hybrid Retrieval** — vector search (BAAI/bge) + keyword fallback with score gating
+* **Rerank Pipeline** — `BAAI/bge-reranker-v2-m3` (CPU/GPU switchable)
+* **Lemmatized KB** — RU+EN, SHA256 caches, sentence chunking, per-file indices
+* **Discord Runtime** — RBAC, command parsing, rate/cooldown limiting, message sanitization
+* **Resilience** — circuit breaker + automatic fallback to local LLM when OpenRouter is unavailable
+* **Telemetry** — rotating log channels per module (`app`, `error`, `rerank`, `embed`, `rag`)
+* **Config as Code** — `.env` + `config.py` + externalized prompts
 
 ---
 
-### ✅ Benefits
+## 🧠 Multistep RAG (`!multy`)
 
-- ✅ **High recall** — decomposition covers multiple facets of the original query  
-- ✅ **Per‑question relevance** — each `Qn` is filtered independently  
-- ✅ **Global coherence** — final rerank aligns all content to the original `Q0`  
-- ✅ **Low hallucination** — responses are grounded in retrieved facts only  
+`!multy` decomposes the primary question `Q0 → [Q1..Qn]`, runs per-question retrieve+rerank, merges candidates, and executes a final rerank against `Q0`. Tunables (`K`, `R`, `F`) are set in `config.py`.
 
-Parameters like `K`, `R`, `F` are fully configurable in `config.py`.
-
-> This structure is ideal for **multi-hop RAG**, world modeling, and decomposed fact retrieval.
+Benefits: high recall, per-facet relevance, coherent final grounding, reduced hallucinations.
 
 ---
 
-## 🛠️ Stack
+## 🛠️ Technology Stack
 
-| Layer         | Tool / Library                        |
-|---------------|---------------------------------------|
+| Layer         | Tooling / Library                     |
+| ------------- | ------------------------------------- |
 | LLM           | `ollama` + `llama3` (local inference) |
-| Retrieval     | `llama-index` + VectorStoreIndex      |
+| Retrieval     | `llama-index` + `VectorStoreIndex`    |
 | Embeddings    | `BAAI/bge-m3`                         |
 | Rerank        | `CrossEncoder` (`bge-reranker-v2-m3`) |
 | Lemmatization | `stanza`, `spaCy`, `langdetect`       |
 | Bot API       | `discord.py`, `aiohttp`               |
-| Infra         | `asyncio`, `rotating logs`, `.env` isolation |
+| Infra         | `asyncio`, rotating logs, `.env`      |
 
 ---
 
-### 🔄 Model Routing
+## 🔄 Model Routing Strategy
 
-By default, the bot uses **OpenRouter (DeepSeek-v3)** for high-quality completions.  
-If OpenRouter is unavailable (e.g., quota exceeded or downtime), it falls back to **local inference (Llama3-8B)** via Ollama on RTX 1060 6GB.
+* **Primary:** OpenRouter (**DeepSeek-v3**)
+* **Fallback:** Local **Llama3‑8B** via Ollama (validated on GeForce **GTX 1060 6GB**)
 
-#### ✅ Tested / Supported Models:
-- DeepSeek-v3 (OpenRouter)
-- DeepSeek-v1 8B
-- Phi-3 Mini
-- Llama3-8B (local)
+**Supported / Tested**
 
-**Final choices**:
-- **DeepSeek-v3** — for high-quality reasoning
-- **Llama3-8B** — for reliable results under resource constraints
+* DeepSeek‑v3 (OpenRouter)
+* DeepSeek‑v1 8B
+* Phi‑3 Mini
+* Llama3‑8B (local)
 
 ---
 
-## 📁 File Layout
-```text
-/LLM
-├── bot/ # Main bot application (entry point, core logic)
-│ ├── main.py # Entry point: init, load index, launch Discord bot
-│ ├── config.py # Global settings and constants
-│ ├── rerank.py # CrossEncoder reranking logic
-│ ├── requirements.txt # Python dependencies (active version)
-│ ├── requirements-backup.txt # Backup dependency list (pip freeze)
-│ ├── rag_cache/ # Vector index + lemma cache
-│ └── pycache/ # Python bytecode cache
-│
-├── parsed/ # Input text/markdown documents for knowledge base
-├── logs/ # Rotating log files (runtime/debug output)
-├── parsers/ # Optional data parsers / preprocessors (WIP)
-│
-├── system_prompt_reason.txt # System prompt for reasoning / verbose QA mode
-├── system_prompt_strict.txt # System prompt for strict factual QA
-├── rephrase.txt # Prompt for question rewriting (optional)
-│
-├── .env # Environment variables (API keys etc.)
-├── .env-example # Example env file for configuration
-├── .gitignore # Git exclusion rules
-└── README.md # Project documentation
----
-```
-## 🧪 QA & Observability
-
-- Full trace logs (per block, per retrieval step)
-- Debug mode shows similarity scores, cache hits, context chunks
-- Input sanitization: char filter, length guard, unique word threshold
-- Commands protected by cooldowns, admin whitelist, regex filters
-- Clean fallback between vector / keyword / local LLM
-
----
-
-## 💬 Example Log — Step-by-Step Breakdown
+## 📁 Repository Layout
 
 ```text
-📥 [Retrieval Stage]
-[INFO ] RAG: Received query → "Does this character bio contain lore violations?"
-[INFO ] Lemma: Loaded index with 45 documents, 0 new files detected
-[INFO ] Vector Search: Top 24 chunks matched (BAAI/bge-m3)
-
-🧠 [Rerank Stage]
-[DEBUG] Rerank: Using model BAAI/bge-reranker-v2-m3 (CPU), query_len=456, input_k=18
-[DEBUG] Filtering 18 candidate pairs (sample: "...Night Spirit. Her followers...")
-[INFO ] Rerank completed in 37.45 sec
-[DEBUG] Top scores: [0.728, 0.013, 0.0027, ...]
-
-🌐 [LLM Query Stage]
-[INFO ] Fallback system: OpenRouter access allowed
-[INFO ] OpenRouter call started (model: DeepSeek-v3)
-[INFO ] OpenRouter HTTP 200 OK
-[INFO ] OpenRouter response successfully received
+LLM/
+├── bot/
+│   ├── main.py                       # async entry, DI wiring, lifecycle
+│   ├── discord_bot.py                # command handlers, RBAC, cooldowns
+│   ├── config.py                     # constants, tunables, paths
+│   ├── index_builder.py              # vector index build/cache/load
+│   ├── rag_filter.py                 # hybrid keyword + semantic filtering
+│   ├── rerank.py                     # CrossEncoder init and scoring
+│   ├── lemma.py                      # RU/EN lemmatization (thread pool)
+│   ├── rag_langchain.py              # optional LC-based experimental pipeline
+│   ├── rag_cache/                    # cache artifacts
+│   ├── __pycache__/
+│   ├── requirements.txt              # active deps
+│   ├── requirements-backup.txt       # frozen backup (pip freeze)
+│   └── tests/                        # optional test modules
+├── parsed/                           # knowledge base sources (md/txt)
+├── parsers/                          # optional preprocessors
+├── logs/                             # rotating logs (app, error, rerank, embed)
+├── rag_cache/                        # root-level cache (legacy/backup)
+├── system_prompt_reason.txt
+├── system_prompt_strict.txt
+├── rephrase.txt
+├── .env                               # secrets (DISCORD_TOKEN, OPENROUTER_API_KEY,…)
+├── .env-example
+├── .gitignore
+├── README.md
+└── LICENSE
 ```
 
-📢 Discord Commands
-!strict <question> — standard RAG reply with rerank
+---
 
-!local <question> — local LLM-only answer
+## 💬 Command Surface (Discord)
 
-!think <question> — alternate prompt mode
+* `!strict <q>` — RAG with rerank (factual QA)
+* `!local <q>` — force local LLM only
+* `!think <q>` — alternate prompt mode
+* `!multy <q>` — decomposed retrieval pipeline
+* `!reload_index` — rebuild index (admin)
+* `!status` — status/diagnostics
+* `!stop` — controlled shutdown (admin)
 
-!reload_index — admin-only index rebuild
+---
 
-!status — debug/info panel
+## 🚀 Setup & Run
 
-!stop — admin-only shutdown
+> **Prereqs**: Python **3.10+**, (optional) CUDA-capable GPU for reranker/LLM acceleration.
 
-!multy <question> — multistep decomposed retrieval pipeline (for complex queries)
+From repo root:
 
-🛠️ Setup
-Clone the repo
-```text
-git clone https://github.com/youruser/amc-rag-bot.git
-cd amc-rag-bot
-```
-Install dependencies
-```text
+```bash
+cd LLM/bot
+python3.10 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+
+# language models for NLP
 python -m spacy download en_core_web_sm
 python -m stanza.download ru
 ```
-Add API keys
-```text
-DISCORD_TOKEN=...
-OPENROUTER_API_KEY=...
-```
-Place your knowledge base into /parsed/
 
-Run the bot
-```text
+Create `.env` (see `.env-example`):
+
+```ini
+DISCORD_TOKEN=your_discord_bot_token
+OPENROUTER_API_KEY=your_openrouter_api_key
+# optional overrides
+# API_URL=https://openrouter.ai/api/v1/chat/completions
+# OR_MODEL=openrouter/auto
+# OR_MAX_TOKENS=512
+# OLLAMA_URL=http://localhost:11434/api/generate
+# LOCAL_MODEL=llama3:8b
+# HTTP_CONN_LIMIT=5
+# OR_RETRIES=3
+# OPENROUTER_BLOCK_SEC=900
+# CTX_LEN_REMOTE=20000
+# CTX_LEN_LOCAL=12000
+# TOP_K=16
+# HTTP_TIMEOUT_TOTAL=240
+```
+
+Add your knowledge base under `LLM/parsed/` (Markdown/Text).
+
+Run the bot:
+
+```bash
 python main.py
 ```
-## ⚡ Why This Matters
-This project shows how an LLM QA Engineer or RAG Architect can:
 
-Build a working hybrid retrieval system
+---
 
-Handle edge cases, multilingual input, and fallback routing
+## 🧪 QA, Telemetry & Troubleshooting
 
-Deploy a real-time QA bot using only Python and open APIs
+* **Traceability**: retrieve → rerank → context assembly → LLM call (timestamps + durations)
+* **Debug surfaces**: similarity scores, cache hits, selected context chunks
+* **Input hygiene**: character filtering, max length guards, unique-token thresholds
+* **Controls**: cooldowns, admin whitelist, regex filters
+* **Fallbacks**: vector ↔ keyword ↔ local LLM; OpenRouter circuit breaker
 
-Deliver results under real constraints (2 days, no prior Python background)
+**Common checks**
 
-Use this repo as a reference, PoC baseline, or technical interview sample.
+* Ensure `.env` is loaded from `LLM/bot` or parent dir
+* Validate GPU visibility if using CUDA (`torch.cuda.is_available()` at startup logs)
+* Clear/rebuild `rag_cache/` when changing corpora
+
+---
+
+## 🔒 Security & Compliance
+
+* Secrets via `.env`; never commit tokens or logs containing credentials
+* Minimal Discord bot permissions (principle of least privilege)
+* Network hardening: timeouts, retries, circuit breaker for upstream provider
+* Log redaction paths reserved for sensitive payloads
+
+---
+
+## ⚙️ Operations (Config & Observability)
+
+* Configuration driven by `config.py` + environment variables
+* Rotating logs under `LLM/logs/` with separate channels (`app`, `error`, `rerank`, `embed`, `rag`)
+* CrossEncoder runs on CPU by default; can switch to GPU if available
+* Context length limits for remote/local models are tunable to meet latency/SLOs
+
+---
+
+## 📈 Performance & Resource Profile (reference rig)
+
+**Hardware**: GeForce **GTX 1060 6GB**, **Intel Core i7‑7700K** @ **4.5 GHz**
+
+**VRAM (Ollama + reranker)**
+
+* Active RAG runs: **~2.5 GB → ~5.3 GB** (increase due to sequential model loads)
+
+**Host RAM (per‑process working set)**
+
+* `python.exe`: **~3.9 GB**
+* `ollama`: **~3.4 GB**
+
+**CPU utilization**
+
+* Idle: **~0%**
+* Strict local query (active): **~50%**
+
+> Figures vary with model choice, prompt/context size, and corpus volume.
+
+---
+
+## ⚠️ Known Limitations & Trade‑offs
+
+* GTX 1060 6GB constrains local model sizes and throughput
+* Lemmatization (RU/EN) may miss rare morphological forms
+* Answer quality depends on KB structure and source quality in `parsed/`
+
+---
+
+## 🧭 Roadmap (short)
+
+* Optional metrics export (latency p50/p95 for retrieve/rerank/LLM)
+* Lightweight eval harness for regression testing on a seed query set
+* Threat model note for token handling & Discord scopes
+
+---
+
+## 📌 Notes
+
+* Focus on clarity of the pipeline and failure modes; designed for constrained GPUs and intermittent upstream availability.
+
+---
 
 ## 🛡 License
-MIT
 
-📬 Contact: asketmc.team+ragbot@gmail.com
+**MIT**
+
+**Contact**: [asketmc.team+ragbot@gmail.com](mailto:asketmc.team+ragbot@gmail.com)
