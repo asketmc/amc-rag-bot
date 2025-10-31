@@ -181,7 +181,7 @@ os.environ.setdefault("OPENROUTER_API_KEY", "dummykey")
 # 📦 IMPORT SYSTEM UNDER TEST (main.py)
 # ──────────────────────────────────────────────────────────────────────────────
 # "Reload" ensures that the module is freshly executed in this clean stubbed context.
-import main
+from asketmc_bot import main
 main = importlib.reload(main)
 
 
@@ -193,6 +193,7 @@ main = importlib.reload(main)
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.skip(reason="query_model moved to llm_client module - see test_llm_client.py")
 async def test_validation_error():
     """
     Test 1 — Input validation for `query_model()`.
@@ -205,19 +206,20 @@ async def test_validation_error():
     Meaning of parameters:
         sys_prompt — system-level instruction for the model
         ctx_txt — contextual retrieved text
-        q — user’s question
+        q — user's question
 
     Expected result:
         Function raises ValueError, because at least one of these inputs must be provided.
 
     Why:
-        This ensures the function doesn’t proceed with an incomplete input, which could
+        This ensures the function doesn't proceed with an incomplete input, which could
         otherwise cause runtime errors or nonsense queries to the model.
     """
     with pytest.raises(ValueError):
         await main.query_model(messages=None, sys_prompt=None, ctx_txt=None, q=None)
 
 
+@pytest.mark.skip(reason="query_model moved to llm_client module - see test_llm_client.py")
 async def test_remote_success(monkeypatch):
     """
     Test 2 — Successful remote (OpenRouter) call.
@@ -247,6 +249,7 @@ async def test_remote_success(monkeypatch):
     assert used_fb is False, "Fallback should not activate when remote succeeds"
 
 
+@pytest.mark.skip(reason="query_model moved to llm_client module - see test_llm_client.py")
 async def test_remote_fail_triggers_fallback_and_breaker(monkeypatch):
     """
     Test 3 — Remote failure triggers fallback and circuit breaker.

@@ -18,7 +18,6 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
 from llama_index.core import VectorStoreIndex
@@ -131,7 +130,7 @@ async def generate_rag_answer(
     char_limit = settings["ctx_len_remote"]
     ctx_txt = build_context(nodes, qlem, char_limit)
 
-    if use_remote is False:
+    if not use_remote:
         prompt_text = (
             f"{sys_prompt.strip()}\n\nCONTEXT:\n{ctx_txt.strip()}\n\nQUESTION: {query.strip()}\nANSWER:"
         )
@@ -176,10 +175,10 @@ async def main() -> None:
                 log.info("Shutdown complete.")
                 stop_event.set()
 
-    async def query_model_text(prompt: str) -> str:
+    async def query_model_text(prompt: str) -> tuple[str, bool]:
         """Simple text query wrapper for the bot."""
-        text, _ = await llm.query_model(messages=[{"role": "user", "content": prompt}])
-        return text
+        text, used_fallback = await llm.query_model(messages=[{"role": "user", "content": prompt}])
+        return text, used_fallback
 
     def is_openrouter_blocked_fn() -> bool:
         """Synchronous breaker check for bot throttling decisions."""
@@ -203,10 +202,14 @@ async def main() -> None:
     )
 
     # Signal handling
+    def _signal_handler(*args) -> None:
+        """Signal handler that creates shutdown task. Args ignored."""
+        asyncio.create_task(shutdown())
+
     for sig_name in ("SIGINT", "SIGTERM"):
         if hasattr(signal, sig_name):
             try:
-                loop.add_signal_handler(getattr(signal, sig_name), lambda: asyncio.create_task(shutdown()))
+                loop.add_signal_handler(getattr(signal, sig_name), _signal_handler)
             except NotImplementedError:
                 pass
 
@@ -225,7 +228,7 @@ if __name__ == "__main__":
     if sys.platform.startswith("win"):
         try:
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        except Exception:
+        except (AttributeError, NotImplementedError):
             pass
 
     try:
