@@ -1,149 +1,161 @@
-# rag_filter.py — фильтрация кандидатов и сборка контекста для RAG
 from __future__ import annotations
 
-from typing import List, FrozenSet, Tuple, Dict, Set
+import asyncio
+import hashlib
 import logging
+from collections import OrderedDict
+from typing import FrozenSet, List, Optional, Sequence, Set, Tuple
 
 from llama_index.core.schema import NodeWithScore
 import config as cfg
 
-# Логгер раздела RAG
+__all__ = ["get_filtered_nodes", "build_context", "purge_filter_cache"]
+
 rag_log = logging.getLogger("asketmc.rag")
 
-# Кэш результатов фильтрации:
-#   key: str (sha256 от отсортированного множества лемм запроса)
-#   val: List[NodeWithScore]
-FILTER_CACHE: Dict[str, List[NodeWithScore]] = {}
+def _cfg(name: str, default):
+    return getattr(cfg, name, default)
 
-def _cache_key(qlem: FrozenSet[str]) -> str:
-    """
-    Вычисляет ключ кэша для множества лемм запроса.
-    """
-    import hashlib
-    key = hashlib.sha256(" ".join(sorted(qlem)).encode("utf-8")).hexdigest()
-    rag_log.debug("[rag_filter._cache_key] qlem=%r -> key=%s", list(qlem), key)
-    return key
+TOP_K: int = int(_cfg("TOP_K", 8))
+FILTER_ALPHA: float = float(_cfg("FILTER_ALPHA", 0.5))
+SCORE_RELATIVE_THRESHOLD: float = float(_cfg("SCORE_RELATIVE_THRESHOLD", 0.7))
+LEMMA_MATCH_RATIO: float = float(_cfg("LEMMA_MATCH_RATIO", 0.10))
+CONTEXT_BONUS_PER_INTERSECTION: float = float(_cfg("CONTEXT_BONUS_PER_INTERSECTION", 0.1))
+FILTER_CACHE_MAX_SIZE: int = int(_cfg("FILTER_CACHE_MAX_SIZE", 256))
 
-async def _filter_nodes(
-    raw_nodes: List[NodeWithScore], qlem: FrozenSet[str]
-) -> List[NodeWithScore]:
-    """
-    Жёсткая фильтрация и ранжирование по относительному скору
-    и пересечению лемм с запросом.
-    """
-    rag_log.info("[rag_filter._filter_nodes] raw_nodes=%d, qlem=%r", len(raw_nodes), list(qlem))
-    if not raw_nodes:
-        rag_log.warning("[rag_filter._filter_nodes] empty raw_nodes -> []")
-        return []
+def _safe_score(v: Optional[float]) -> float:
+    try:
+        return float(v) if v is not None else 0.0
+    except Exception:
+        return 0.0
 
-    max_score = max(n.score for n in raw_nodes)
-    rag_log.debug("[rag_filter._filter_nodes] max_score=%.6f", max_score)
+def _node_id(n: NodeWithScore) -> str:
+    node = n.node
+    return (
+        getattr(node, "node_id", None)
+        or getattr(node, "id_", None)
+        or node.metadata.get("node_id")
+        or node.metadata.get("doc_id")
+        or node.metadata.get("file_name")
+        or f"node@{id(node)}"
+    )
 
-    alpha = getattr(cfg, "FILTER_ALPHA", 0.5)
-    strict: List[Tuple[NodeWithScore, float]] = []
-    for idx, n in enumerate(raw_nodes):
-        lemmas = frozenset(n.node.metadata.get("lemmas", []))
-        inter = len(qlem & lemmas)
-        rel_score = n.score / (max_score or 1.0)
-        ratio = inter / (len(qlem) or 1)
-        weight = n.score + alpha * ratio
-        rag_log.debug(
-            "[rag_filter._filter_nodes] idx=%d file=%r score=%.6f rel=%.3f inter=%d ratio=%.3f weight=%.3f",
-            idx, n.node.metadata.get("file_name", "n/a"), n.score, rel_score, inter, ratio, weight
-        )
-        if (
-            rel_score >= getattr(cfg, "SCORE_RELATIVE_THRESHOLD", 0.7)
-            or ratio >= getattr(cfg, "LEMMA_MATCH_RATIO", 0.1)
-        ):
-            strict.append((n, weight))
+def _metadata_lemmas(n: NodeWithScore) -> FrozenSet[str]:
+    lem = n.node.metadata.get("lemmas", [])
+    try:
+        return frozenset(str(x) for x in lem)
+    except Exception:
+        return frozenset()
 
-    if strict:
-        strict.sort(key=lambda x: -x[1])
-        for i, (n, w) in enumerate(strict[: cfg.TOP_K]):
-            rag_log.debug(
-                "[rag_filter._filter_nodes] TOP#%d file=%r score=%.6f weight=%.3f",
-                i, n.node.metadata.get("file_name", "n/a"), n.score, w
-            )
-        return [n for n, _ in strict[: cfg.TOP_K]]
-
-    # Fallback: хотя бы одно пересечение лемм
-    fallback: List[Tuple[NodeWithScore, float, int, float]] = []
-    for idx, n in enumerate(raw_nodes):
-        lemmas = frozenset(n.node.metadata.get("lemmas", []))
-        inter = len(qlem & lemmas)
-        ratio = inter / (len(qlem) or 1)
-        weight = n.score + alpha * ratio
-        if inter > 0:
-            fallback.append((n, weight, inter, n.score))
-        rag_log.debug(
-            "[rag_filter._filter_nodes:fallback] idx=%d file=%r score=%.6f inter=%d weight=%.3f",
-            idx, n.node.metadata.get("file_name", "n/a"), n.score, inter, weight
-        )
-
-    fallback.sort(key=lambda x: -x[1])
-    for i, (n, w, inter, score) in enumerate(fallback[: cfg.TOP_K]):
-        rag_log.debug(
-            "[rag_filter._filter_nodes:fallback] TOP#%d file=%r score=%.6f inter=%d weight=%.3f",
-            i, n.node.metadata.get("file_name", "n/a"), score, inter, w
-        )
-    return [n for n, _, _, _ in fallback[: cfg.TOP_K]]
-
-async def get_filtered_nodes(
-    raw_nodes: List[NodeWithScore], qlem: FrozenSet[str]
-) -> List[NodeWithScore]:
-    """
-    Кэшируемая обёртка над _filter_nodes.
-    """
-    key = _cache_key(qlem)
-    if key in FILTER_CACHE:
-        rag_log.info("[rag_filter.get_filtered_nodes] cache hit key=%s nodes=%d", key, len(FILTER_CACHE[key]))
-        return FILTER_CACHE[key]
-    rag_log.info("[rag_filter.get_filtered_nodes] cache miss key=%s -> filter", key)
-    nodes = await _filter_nodes(raw_nodes, qlem)
-    FILTER_CACHE[key] = nodes
-    return nodes
+def _cache_key(qlem: FrozenSet[str], raw_nodes: Sequence[NodeWithScore]) -> str:
+    q_part = " ".join(sorted(qlem))
+    fp_items: List[str] = []
+    for n in raw_nodes[:64]:
+        fp_items.append(f"{_node_id(n)}:{_safe_score(n.score):.6f}")
+    fp = "|".join(fp_items)
+    return hashlib.sha256(f"{q_part}||{fp}".encode("utf-8")).hexdigest()
 
 def _content_from_node(n: NodeWithScore) -> str:
-    txt = getattr(n.node, "get_content", lambda: "")()
-    rag_log.debug("[rag_filter._content_from_node] file=%r len=%d",
-                  n.node.metadata.get("file_name", "n/a"), len(txt))
-    return txt
+    node = n.node
+    try:
+        if hasattr(node, "get_content"):
+            return node.get_content(metadata_mode="none") or ""
+        return getattr(node, "text", "") or ""
+    except Exception:
+        return ""
 
-def build_context(
-    nodes: List[NodeWithScore], qlem: FrozenSet[str], char_limit: int
-) -> str:
-    """
-    Сборка итогового контекста из уникальных чанков (до лимита символов).
-    """
-    rag_log.info("[rag_filter.build_context] nodes=%d char_limit=%d", len(nodes), char_limit)
-    beta = 0.1
+_FILTER_CACHE: "OrderedDict[str, Tuple[NodeWithScore, ...]]" = OrderedDict()
+_FILTER_CACHE_LOCK = asyncio.Lock()
+
+def _cache_get(key: str) -> Optional[List[NodeWithScore]]:
+    tpl = _FILTER_CACHE.get(key)
+    if tpl is None:
+        return None
+    _FILTER_CACHE.move_to_end(key, last=True)
+    return list(tpl)
+
+def _cache_put(key: str, nodes: List[NodeWithScore]) -> None:
+    _FILTER_CACHE[key] = tuple(nodes)
+    _FILTER_CACHE.move_to_end(key, last=True)
+    while len(_FILTER_CACHE) > FILTER_CACHE_MAX_SIZE:
+        _FILTER_CACHE.popitem(last=False)
+
+def purge_filter_cache() -> None:
+    _FILTER_CACHE.clear()
+
+async def _filter_nodes(raw_nodes: List[NodeWithScore], qlem: FrozenSet[str]) -> List[NodeWithScore]:
+    if not raw_nodes:
+        return []
+    scores = [_safe_score(n.score) for n in raw_nodes]
+    max_score = max(scores) if scores else 1.0
+    if max_score <= 0.0:
+        max_score = 1.0
+    alpha = FILTER_ALPHA
+    strict: List[Tuple[NodeWithScore, float]] = []
+    for n in raw_nodes:
+        s = _safe_score(n.score)
+        lemmas = _metadata_lemmas(n)
+        inter = len(qlem & lemmas)
+        rel_score = s / max_score
+        ratio = inter / (len(qlem) or 1)
+        weight = s + alpha * ratio
+        if (rel_score >= SCORE_RELATIVE_THRESHOLD) or (ratio >= LEMMA_MATCH_RATIO):
+            strict.append((n, weight))
+    if strict:
+        strict.sort(key=lambda x: x[1], reverse=True)
+        return [n for n, _ in strict[:TOP_K]]
+    fallback: List[Tuple[NodeWithScore, float, int, float]] = []
+    for n in raw_nodes:
+        s = _safe_score(n.score)
+        lemmas = _metadata_lemmas(n)
+        inter = len(qlem & lemmas)
+        if inter <= 0:
+            continue
+        ratio = inter / (len(qlem) or 1)
+        weight = s + alpha * ratio
+        fallback.append((n, weight, inter, s))
+    fallback.sort(key=lambda x: x[1], reverse=True)
+    return [n for n, _, _, _ in fallback[:TOP_K]]
+
+async def get_filtered_nodes(raw_nodes: List[NodeWithScore], qlem: FrozenSet[str]) -> List[NodeWithScore]:
+    key = _cache_key(qlem, raw_nodes)
+    async with _FILTER_CACHE_LOCK:
+        cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    nodes = await _filter_nodes(raw_nodes, qlem)
+    async with _FILTER_CACHE_LOCK:
+        _cache_put(key, nodes)
+    return list(nodes)
+
+def build_context(nodes: List[NodeWithScore], qlem: FrozenSet[str], char_limit: int) -> str:
+    beta = CONTEXT_BONUS_PER_INTERSECTION
     scored: List[Tuple[NodeWithScore, float]] = []
     for n in nodes:
-        lemmas = frozenset(n.node.metadata.get("lemmas", []))
-        inter = len(qlem & lemmas)
-        weight = n.score + beta * inter
+        s = _safe_score(n.score)
+        inter = len(qlem & _metadata_lemmas(n))
+        weight = s + beta * float(inter)
         scored.append((n, weight))
-        rag_log.debug(
-            "[rag_filter.build_context] file=%r score=%.6f inter=%d weight=%.6f",
-            n.node.metadata.get("file_name", "n/a"), n.score, inter, weight
-        )
     scored.sort(key=lambda x: x[1], reverse=True)
-
     parts: List[str] = []
-    seen_hashes: Set[int] = set()
+    seen_hashes: Set[str] = set()
     total = 0
+    sep = "\n---\n"
+    sep_len = len(sep)
     for n, _ in scored:
-        txt = _content_from_node(n).strip()
+        txt = (_content_from_node(n) or "").strip()
         if not txt:
             continue
-        h = hash(txt)
+        h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
         if h in seen_hashes:
             continue
-        if total + len(txt) > char_limit:
-            rag_log.info("[rag_filter.build_context] limit reached total=%d", total)
+        prospective = total + (sep_len if parts else 0) + len(txt)
+        if prospective > max(0, int(char_limit)):
             break
         seen_hashes.add(h)
+        if parts:
+            parts.append(sep)
+            total += sep_len
         parts.append(txt)
-        total += len(txt) + 4
-    rag_log.info("[rag_filter.build_context] parts=%d total=%d", len(parts), total)
-    return "\n---\n".join(parts)
+        total += len(txt)
+    return "".join(parts)
