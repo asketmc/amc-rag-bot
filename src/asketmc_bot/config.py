@@ -1,69 +1,102 @@
-# config.py — configuration for the RAG bot Asketmc
+#!/usr/bin/env python3.10
+"""
+config.py — Configuration for the Asketmc RAG Discord bot.
+
+Goals:
+- Clear separation of concerns: path layout, model/RAG settings, runtime limits.
+- All paths resolve to absolute Paths and live under project root by default.
+- No .env reads here (handled in main.py); values are code-defined for stability.
+
+Environment overrides (optional, read by your own code where applicable):
+- ASKETMC_VAR_DIR     → directory for logs/caches (default: <PROJECT_ROOT>/var)
+- ASKETMC_DATA_DIR    → directory for data (default: <PROJECT_ROOT>/data)
+- ASKETMC_PROMPTS_DIR → directory for prompt files (default: <PKG_ROOT>/data)
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
-import re
+from typing import Pattern, Set
 import asyncio
-import os
 import logging
+import os
+import re
 
-# ─── Paths ───────────────────────────────────────────────
-# Project root (…/LLM). This file lives in src/asketmc_bot/config.py:
-# …/LLM/src/asketmc_bot/config.py → parents[1] = …/LLM/src, parents[2] = …/LLM
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# ──────────────────────────────────────────────────────────────────────────────
+# Paths
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Mutable artifacts (logs, caches) live outside the package in /var by default.
-VAR_ROOT = Path(os.getenv("ASKETMC_VAR_DIR", PROJECT_ROOT / "var"))
+# Package root (.../src/asketmc_bot) and project root (.../LM)
+PKG_ROOT: Path = Path(__file__).resolve().parent
+PROJECT_ROOT: Path = PKG_ROOT.parents[1]
 
-# Input data (parsed KB, prompts) live in /data by default.
-DATA_ROOT = Path(os.getenv("ASKETMC_DATA_DIR", PROJECT_ROOT / "data"))
+# Mutable artifacts (logs, caches)
+VAR_ROOT: Path = Path(os.getenv("ASKETMC_VAR_DIR", PROJECT_ROOT / "var")).resolve()
+LOG_DIR: Path = VAR_ROOT / "logs"
+CACHE_PATH: Path = VAR_ROOT / "rag_cache"
+HASH_FILE: Path = CACHE_PATH / "docs_hash.json"
 
-# Optional: separate dir for prompt files; by default reuse DATA_ROOT.
-PROMPTS_DIR = Path(os.getenv("ASKETMC_PROMPTS_DIR", DATA_ROOT))
+# Data & prompts
+DATA_ROOT: Path = Path(os.getenv("ASKETMC_DATA_DIR", PROJECT_ROOT / "data")).resolve()
+DOCS_PATH: Path = DATA_ROOT / "parsed"
 
-# Knowledge base documents (parsed text/markdown).
-DOCS_PATH = DATA_ROOT / "parsed"
+PROMPTS_DIR: Path = Path(os.getenv("ASKETMC_PROMPTS_DIR", PKG_ROOT / "data")).resolve()
+PROMPT_STRICT: Path = PROMPTS_DIR / "system_prompt_strict.txt"
+PROMPT_REASON: Path = PROMPTS_DIR / "system_prompt_reason.txt"
+PROMPT_REPHRASE: Path = PROMPTS_DIR / "rephrase.txt"
 
-# RAG cache and hash file for index invalidation.
-CACHE_PATH = VAR_ROOT / "rag_cache"
-HASH_FILE = CACHE_PATH / "docs_hash.json"
+# Ensure directories exist (idempotent)
+for _p in (VAR_ROOT, LOG_DIR, CACHE_PATH, DATA_ROOT, PROMPTS_DIR):
+    _p.mkdir(parents=True, exist_ok=True)
 
-# Centralized logs directory (used by RotatingFileHandler).
-LOG_DIR = VAR_ROOT / "logs"
+# ──────────────────────────────────────────────────────────────────────────────
+# Rerank settings
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Prompt files (place them in /data by default; override via ASKETMC_PROMPTS_DIR).
-PROMPT_STRICT = PROMPTS_DIR / "system_prompt_strict.txt"
-PROMPT_REASON = PROMPTS_DIR / "system_prompt_reason.txt"
-PROMPT_REPHRASE = PROMPTS_DIR / "rephrase.txt"
+RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-v2-m3"
+RERANK_INPUT_K: int = 18
+RERANK_OUTPUT_K: int = 9
+BATCH_SIZE: int = 8
+MAX_LEN: int = 512
+QUERY_MAX_CHARS: int = 2048
+EXECUTOR_WORKERS: int = 2
+RERANKER_DEVICE: str = "cpu"  # or "cuda"
 
-# ─── Rerank settings ─────────────────────────────────────
-RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
-RERANK_INPUT_K = 18
-RERANK_OUTPUT_K = 9
-BATCH_SIZE = 8
-MAX_LEN = 512
-QUERY_MAX_CHARS = 2048
-EXECUTOR_WORKERS = 2
-RERANKER_DEVICE = "cpu"  # or "cuda"
+# ──────────────────────────────────────────────────────────────────────────────
+# Models and parameters
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ─── Models and parameters ───────────────────────────────
-TOP_K = 24
-MIN_SCORE = 0.35
-OR_MODEL = "deepseek/deepseek-chat:free"
-LOCAL_MODEL = "llama3.1:8b"
-OR_MAX_TOKENS = 2048
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-OPENROUTER_BLOCK_SEC = 900
-CHUNK_SIZE = 512
-CHUNK_OVERLAP = 128
-LEMMA_MATCH_RATIO = 0.2
-SCORE_RELATIVE_THRESHOLD = 0.15
-DEBUG = True
+TOP_K: int = 24
+MIN_SCORE: float = 0.35
 
-GOOD_POS = {
+# Remote / local LLM defaults (OpenRouter / Ollama)
+OR_MODEL: str = "deepseek/deepseek-chat:free"
+LOCAL_MODEL: str = "llama3.1:8b"
+OR_MAX_TOKENS: int = 2048
+API_URL: str = "https://openrouter.ai/api/v1/chat/completions"
+OLLAMA_URL: str = "http://127.0.0.1:11434/api/generate"
+
+# Context building / chunking
+CHUNK_SIZE: int = 512
+CHUNK_OVERLAP: int = 128
+LEMMA_MATCH_RATIO: float = 0.2
+SCORE_RELATIVE_THRESHOLD: float = 0.15
+
+# Context limits (align with main.py expectations)
+CTX_LEN_REMOTE: int = 20_000  # when using remote model
+CTX_LEN_LOCAL: int = 12_000   # when using local model
+
+DEBUG: bool = True
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stop-words / POS filters (RU-focused with some general noise)
+# ──────────────────────────────────────────────────────────────────────────────
+
+GOOD_POS: Set[str] = {
     "NOUN", "ADJF", "ADJS", "VERB", "INFN", "PRTF", "GRND", "NUMR",
 }
 
-STOP_WORDS = {
+STOP_WORDS: Set[str] = {
     # pronouns
     "я", "ты", "он", "она", "оно", "мы", "вы", "они",
     "мой", "твой", "его", "её", "наш", "ваш", "их", "свой",
@@ -78,7 +111,7 @@ STOP_WORDS = {
     "в", "во", "на", "за", "к", "ко", "с", "со", "от", "перед",
     "при", "об", "обо", "по", "до", "из", "иза", "без", "для",
     "над", "под", "между", "около", "через", "про", "среди",
-    "из-за", "из-под", "внутри", "вне", "после", "перед", "согласно",
+    "из-за", "из-под", "внутри", "вне", "после", "согласно",
     # conjunctions
     "и", "а", "но", "да", "или", "либо", "тоже", "также",
     "что", "чтобы", "если", "когда", "пока", "хотя", "потому",
@@ -90,7 +123,7 @@ STOP_WORDS = {
     # modal/parenthetical
     "можно", "нельзя", "нужно", "надо", "следует", "должно",
     "может", "наверное", "возможно", "пожалуй", "кажется",
-    "видимо", "якобы", "будто", "типа",
+    "видимо", "якобы", "типа",
     # copulas/aux
     "быть", "есть", "нет", "являться", "становиться", "стать",
     "бывать", "оказаться", "мочь", "смочь",
@@ -111,38 +144,66 @@ STOP_WORDS = {
     "сорри", "имхо", "лол", "кек", "хех",
 }
 
-# ─── Runtime constants (used in main.py and rag_multistage) ───────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Runtime constants (used in main.py and RAG stages)
+# ──────────────────────────────────────────────────────────────────────────────
+
 log = logging.getLogger("asketmc.config")
 
 def get_conf(name: str, default, typ=None):
     """
-    Allows overriding config.py variables via environment or uses default.
-    Type can be specified for safe casting.
+    Fetch a configuration variable from this module's globals with optional type casting.
+    Allows overriding via monkey-patching in tests; does NOT read .env directly.
     """
     try:
         val = globals().get(name, default)
-        if typ and not isinstance(val, typ):
+        if typ is not None and not isinstance(val, typ):
             val = typ(val)
         return val
     except Exception as e:
         log.warning("[config.get_conf] Error retrieving %s: %s", name, e)
         return default
 
-# ─── Runtime constants (hardcoded, not loaded from .env) ───────────────
-OR_RETRIES = 1           # Retry count for OpenRouter
-CTX_LEN_REMOTE = 12_000  # Max context length when using OpenRouter
-CTX_LEN_LOCAL = 20_000   # Max context length for local model
-USER_LAST_CLEAN = 3600   # Cleanup interval for user_last (in seconds)
-EMBED_LOG_EVERY = 1000   # Log every N embeddings
-LEMMA_CACHE_SIZE = 200_000  # Lemmatization cache size
+# Retries, context limits, housekeeping
+OR_RETRIES: int = 3
+HTTP_CONN_LIMIT: int = 5              # max concurrent HTTP sessions
+HTTP_TIMEOUT_TOTAL: int = 240         # total request timeout (seconds)
+OPENROUTER_BLOCK_SEC: int = 120       # circuit-breaker base block (seconds)
+OPENROUTER_BLOCK_MAX_SEC: int = 900   # circuit-breaker max block (seconds)
 
-# ─── Discord ────────────────────────────────────────────
-ALLOWED_CHANNELS = {1384890201544982568}  # Replace with your channel ID
-MAX_QUESTION_LEN = 500
-USER_COOLDOWN = 10  # sec
-REQUEST_SEMAPHORE = asyncio.Semaphore(3)
-ALLOWED_CHARS = re.compile(r"^[ а-яА-ЯёЁa-zA-Z0-9,.?!()\-—]+$")
-HTTP_CONN_LIMIT = 5  # 10 under load
+USER_LAST_CLEAN: int = 3600           # Cleanup interval for user_last (seconds)
+EMBED_LOG_EVERY: int = 1000           # Log every N embeddings
+LEMMA_CACHE_SIZE: int = 200_000       # Lemmatization cache size
 
-# ─── Administrator permissions ──────────────────────────
-ADMIN_IDS = {267614224631463937}  # Put your admin Discord ID here. Discord user IDs allowed to run !reload_index
+# Discord and rate limiting
+ALLOWED_CHANNELS: Set[int] = {1384890201544982568}  # replace with your channel ID(s)
+MAX_QUESTION_LEN: int = 500
+USER_COOLDOWN: int = 10  # seconds
+REQUEST_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(3)
+ALLOWED_CHARS: Pattern[str] = re.compile(r"^[ а-яА-ЯёЁa-zA-Z0-9,.?!()\-—]+$")
+
+# Administrator permissions
+ADMIN_IDS: Set[int] = {267614224631463937}  # Discord user IDs allowed to run admin commands
+
+__all__ = [
+    # Paths
+    "PKG_ROOT", "PROJECT_ROOT", "VAR_ROOT", "DATA_ROOT", "PROMPTS_DIR",
+    "DOCS_PATH", "CACHE_PATH", "HASH_FILE", "LOG_DIR",
+    "PROMPT_STRICT", "PROMPT_REASON", "PROMPT_REPHRASE",
+    # Rerank
+    "RERANKER_MODEL_NAME", "RERANK_INPUT_K", "RERANK_OUTPUT_K", "BATCH_SIZE",
+    "MAX_LEN", "QUERY_MAX_CHARS", "EXECUTOR_WORKERS", "RERANKER_DEVICE",
+    # Models / RAG params
+    "TOP_K", "MIN_SCORE", "OR_MODEL", "LOCAL_MODEL", "OR_MAX_TOKENS",
+    "API_URL", "OLLAMA_URL",
+    "CHUNK_SIZE", "CHUNK_OVERLAP", "LEMMA_MATCH_RATIO", "SCORE_RELATIVE_THRESHOLD",
+    "CTX_LEN_REMOTE", "CTX_LEN_LOCAL", "DEBUG",
+    "GOOD_POS", "STOP_WORDS",
+    # Runtime constants
+    "get_conf", "OR_RETRIES", "HTTP_CONN_LIMIT", "HTTP_TIMEOUT_TOTAL",
+    "OPENROUTER_BLOCK_SEC", "OPENROUTER_BLOCK_MAX_SEC",
+    "USER_LAST_CLEAN", "EMBED_LOG_EVERY", "LEMMA_CACHE_SIZE",
+    # Discord / limits / admin
+    "ALLOWED_CHANNELS", "MAX_QUESTION_LEN", "USER_COOLDOWN",
+    "REQUEST_SEMAPHORE", "ALLOWED_CHARS", "ADMIN_IDS",
+]

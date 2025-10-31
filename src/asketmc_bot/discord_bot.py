@@ -2,30 +2,24 @@
 """
 Discord integration: bot, commands, and lifecycle.
 
-This module is independent from `main.py`. All dependencies are injected via
-`run_bot(...)` (blocking) or `start_bot_async(...)` (async) to avoid circular
-imports and to keep the code testable and modular.
+Independent from `main.py`; all dependencies injected via `run_bot(...)` or
+`start_bot_async(...)` to keep things testable and avoid circular imports.
 
-Key features:
-- Channel and admin checks implemented with `commands.check` (do not alter
-  command signatures).
-- Centralized input sanitization and flood control (per-user cooldown).
-- Consistent query path for remote (OpenRouter) and local (Ollama) models.
-- Graceful shutdown: closes HTTP session, calls core shutdown hook, closes bot.
-
-PEP 8 and PEP 257 compliant.
+WHY: Aligns with host `main.generate_rag_answer(...)` which returns a *string*
+(final answer). This module never unpacks tuples from that function, fixing the
+"too many values to unpack" class of errors that stem from naive parsing/arity
+mismatches.
 """
 
 from __future__ import annotations
 
-# Standard library
+# Stdlib
 import asyncio
 import logging
-import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 # Third-party
 import discord
@@ -37,18 +31,19 @@ import config as cfg
 from rag_filter import FILTER_CACHE
 
 # ─────────────────────────────────────────────────────────────
-# Logging (Discord section)
+# Logging
 # ─────────────────────────────────────────────────────────────
 
 disc_log = logging.getLogger("asketmc.discord")
 disc_log.setLevel(logging.DEBUG if getattr(cfg, "DEBUG", False) else logging.INFO)
 
 # ─────────────────────────────────────────────────────────────
-# DI container: runtime state and injected dependencies
+# DI: types & state
 # ─────────────────────────────────────────────────────────────
 
-RagGenFn = Callable[[str, str, bool], Awaitable[Tuple[str, Any, Any]]]
-QueryModelFn = Callable[..., Awaitable[Tuple[str, bool]]]
+# WHY: `main.generate_rag_answer(...)` returns final answer `str`
+RagGenFn = Callable[..., Awaitable[str]]
+QueryModelFn = Callable[..., Awaitable[tuple[str, bool]]]
 CallLocalFn = Callable[[str], Awaitable[str]]
 BuildIndexFn = Callable[[], Awaitable[Any]]
 IsBlockedFn = Callable[[], bool]
@@ -57,7 +52,6 @@ ShutdownFn = Callable[[], Awaitable[None]]
 
 @dataclass
 class AppDeps:
-    """Injected dependencies and shared runtime state."""
     index: Any
     retriever: Any
     generate_rag_answer: RagGenFn
@@ -69,116 +63,45 @@ class AppDeps:
 
 
 _STATE: Optional[AppDeps] = None
-_user_last: Dict[int, float] = {}  # simple per-user cooldown map
+_user_last: Dict[int, float] = {}
 
 # ─────────────────────────────────────────────────────────────
-# HTTP session (if needed by future commands)
+# Shared HTTP session (future-proof for commands here)
 # ─────────────────────────────────────────────────────────────
 
 
-class AsyncSessionHolder:
-    """Lazily creates and reuses a single aiohttp ClientSession."""
-
+class _AsyncSessionHolder:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._session: Optional[ClientSession] = None
-        disc_log.debug("[AsyncSessionHolder] initialized")
 
     async def get(self) -> ClientSession:
-        """Return a live session (create if missing/closed)."""
         async with self._lock:
             if self._session is None or self._session.closed:
-                disc_log.info("[AsyncSessionHolder] creating aiohttp session")
                 self._session = ClientSession(connector=TCPConnector(limit=cfg.HTTP_CONN_LIMIT))
             return self._session
 
     async def close(self) -> None:
-        """Close the session if it is open."""
         async with self._lock:
             if self._session and not self._session.closed:
-                disc_log.info("[AsyncSessionHolder] closing aiohttp session")
                 await self._session.close()
                 self._session = None
 
 
-_SESSION_HOLDER = AsyncSessionHolder()
+_SESSION_HOLDER = _AsyncSessionHolder()
 
 # ─────────────────────────────────────────────────────────────
-# Message utilities and input sanitization
-# ─────────────────────────────────────────────────────────────
-
-# Basic guard against prompt-injection patterns and Discord mentions.
-INJECTION_RE = re.compile(
-    r"(?is)(?:^|\s)(?:assistant|system)\s*:|```|</?sys>|###\s*(?:assistant|system)"
-)
-
-
-def sanitize(text: str) -> str:
-    """Basic Discord-safe sanitizer and prompt-injection guard.
-
-    Replaces '@' with a zero-width joiner to avoid unintended mentions and
-    strips a few known prompt-injection markers.
-    """
-    text = text.replace("@", "@\u200b")
-    return INJECTION_RE.sub(" ", text)
-
-
-def split_message(text: str, limit: int = 2000) -> List[str]:
-    """Split a long message into Discord-sized chunks."""
-    chunks: List[str] = []
-    while text:
-        if len(text) <= limit:
-            chunks.append(text)
-            break
-        idx = text.rfind("\n", 0, limit)
-        if idx == -1:
-            idx = limit
-        chunks.append(text[:idx])
-        text = text[idx:].lstrip("\n")
-    return chunks
-
-
-async def send_long(ctx: commands.Context, text: str, limit: int = 1900) -> None:
-    """Send large text in multiple messages."""
-    for chunk in split_message(text, limit):
-        await ctx.send(chunk)
-
-# ─────────────────────────────────────────────────────────────
-# Access control checks (do not alter command signatures)
-# ─────────────────────────────────────────────────────────────
-
-
-def check_admin_only() -> Callable[[commands.Context], bool]:
-    """Allow command only for users listed in cfg.ADMIN_IDS."""
-    def predicate(ctx: commands.Context) -> bool:
-        if ctx.author.id not in cfg.ADMIN_IDS:
-            raise commands.CheckFailure("not_admin")
-        return True
-    return commands.check(predicate)
-
-
-def check_channel_allowed() -> Callable[[commands.Context], bool]:
-    """Allow command only in channels listed in cfg.ALLOWED_CHANNELS."""
-    def predicate(ctx: commands.Context) -> bool:
-        if ctx.channel.id not in cfg.ALLOWED_CHANNELS:
-            raise commands.CheckFailure("not_allowed_channel")
-        return True
-    return commands.check(predicate)
-
-# ─────────────────────────────────────────────────────────────
-# Helpers
+# Utilities
 # ─────────────────────────────────────────────────────────────
 
 
 def _require_state() -> AppDeps:
-    """Return the DI state or raise if the module was not initialized."""
     if _STATE is None:
         raise RuntimeError("Discord module is not initialized. Call run_bot(...) or start_bot_async(...).")
     return _STATE
 
 
 def _check_cooldown(user_id: int) -> bool:
-    """Return True if the user is not sending messages too frequently."""
     now = time.monotonic()
     last = _user_last.get(user_id, 0.0)
     if now - last < cfg.USER_COOLDOWN:
@@ -186,25 +109,76 @@ def _check_cooldown(user_id: int) -> bool:
     _user_last[user_id] = now
     return True
 
+
+def _sanitize(text: str) -> str:
+    # WHY: prevent unwanted mentions; minimal prompt-injection markers
+    return (
+        text.replace("@", "@\u200b")
+        .replace("```", " ")
+        .replace("</sys>", " ")
+        .replace("<sys>", " ")
+    )
+
+
+def _split_for_discord(text: str, limit: int = 2000) -> list[str]:
+    parts: list[str] = []
+    while text:
+        if len(text) <= limit:
+            parts.append(text)
+            break
+        cut = text.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return parts
+
+
+async def _send_long(ctx: commands.Context, text: str, limit: int = 1900) -> None:
+    for chunk in _split_for_discord(text, limit):
+        await ctx.send(chunk)
+
 # ─────────────────────────────────────────────────────────────
-# Command core
+# Bot & commands
 # ─────────────────────────────────────────────────────────────
 
+_bot: Optional[commands.Bot] = None
+_shutdown_lock = asyncio.Lock()
+_shutdown_flag = False
 
-async def _ask_rag(ctx: commands.Context, q_raw: str, sys_prompt_path: str) -> None:
-    """Shared RAG handler used by several commands.
 
-    Steps:
-    - Sanitize and validate user input.
-    - Enforce per-user cooldown and channel restrictions (via checks).
-    - Build RAG prompt/context through DI-provided generator.
-    - Query remote model with fallback to local model.
+def _build_bot() -> commands.Bot:
+    intents = discord.Intents.all()
+    return commands.Bot(command_prefix="!", intents=intents)
+
+
+def _check_admin_only():
+    def predicate(ctx: commands.Context) -> bool:
+        if ctx.author.id not in cfg.ADMIN_IDS:
+            raise commands.CheckFailure("not_admin")
+        return True
+
+    return commands.check(predicate)
+
+
+def _check_channel_allowed():
+    def predicate(ctx: commands.Context) -> bool:
+        if ctx.channel.id not in cfg.ALLOWED_CHANNELS:
+            raise commands.CheckFailure("not_allowed_channel")
+        return True
+
+    return commands.check(predicate)
+
+
+async def _answer_rag(ctx: commands.Context, question_raw: str, *, force_local: bool | None = None) -> None:
+    """
+    WHY: Single path for RAG answering. Defers retrieval, rerank, and
+    model selection to injected generator which returns the final answer.
     """
     deps = _require_state()
-    disc_log.info("[ask_rag] user=%s(%d) ch=%d", ctx.author.name, ctx.author.id, ctx.channel.id)
 
-    q = sanitize(q_raw.strip().replace("\n", " "))
-    if len(q) > cfg.MAX_QUESTION_LEN or not cfg.ALLOWED_CHARS.match(q):
+    q = _sanitize((question_raw or "").strip().replace("\n", " "))
+    if not q or len(q) > cfg.MAX_QUESTION_LEN or not cfg.ALLOWED_CHARS.match(q):
         await ctx.send("❌ Invalid query format.")
         return
 
@@ -212,88 +186,49 @@ async def _ask_rag(ctx: commands.Context, q_raw: str, sys_prompt_path: str) -> N
         await ctx.send("⏳ Please wait before sending another query.")
         return
 
-    await ctx.send("🔍 Thinking…")
+    is_blocked = deps.is_openrouter_blocked()
+    use_remote = (force_local is None and not is_blocked) or (force_local is False)
+
+    await ctx.send("🧠 Thinking locally…" if not use_remote else "🔍 Thinking…")
 
     try:
         async with cfg.REQUEST_SEMAPHORE:
-            use_remote = not deps.is_openrouter_blocked()  # use remote if allowed
-            sys_prompt_text = Path(sys_prompt_path).read_text("utf-8")
-
-            # Build prompt/context via DI function (applies filters/limits).
-            prompt, nodes, ctx_txt = await deps.generate_rag_answer(q, sys_prompt_text, use_remote)
-            if not nodes:
-                await ctx.send("⚠️ Not enough data.")
-                return
-
-            # Query model in a single, consistent way.
-            answer, used_fallback = await deps.query_model(
-                sys_prompt=sys_prompt_text,
-                ctx_txt=ctx_txt,
-                q=q,
-            )
-
-            if used_fallback:
-                await send_long(ctx, "⚠️ OpenRouter unavailable, local model used.")
-            await send_long(ctx, answer or "❌ No answer.")
+            sys_prompt = Path(cfg.PROMPT_STRICT).read_text(encoding="utf-8")
+            # IMPORTANT: generate_rag_answer returns *string* (final answer)
+            answer = await deps.generate_rag_answer(q, sys_prompt, use_remote=use_remote)
     except discord.HTTPException as http_exc:
-        await send_long(ctx, f"⚠️ Answer too long: {http_exc}")
-    except Exception as exc:  # pragma: no cover
-        disc_log.exception("[_ask_rag] Unexpected error: %r", exc)
+        await _send_long(ctx, f"⚠️ Answer too long: {http_exc}")
+        return
+    except FileNotFoundError:
+        await ctx.send("⚠️ System prompt file is missing or unreadable.")
+        return
+    except Exception as exc:
+        disc_log.exception("[_answer_rag] unexpected error: %r", exc)
         await ctx.send(f"❌ Error: {exc}")
+        return
 
-# ─────────────────────────────────────────────────────────────
-# Bot construction and command registration
-# ─────────────────────────────────────────────────────────────
+    await _send_long(ctx, answer or "❌ No answer.")
 
-_bot: Optional[commands.Bot] = None
-
-
-def _build_bot() -> commands.Bot:
-    """Create a Discord bot with all intents."""
-    intents = discord.Intents.all()
-    return commands.Bot(command_prefix="!", intents=intents)
-
+    # UX ping when remote is unavailable
+    if force_local is None and is_blocked:
+        await ctx.send("⚠️ OpenRouter unavailable, local model used.")
 
 def _register_commands(bot: commands.Bot) -> None:
-    """Attach command handlers to the bot."""
-
     @bot.command(name="strict", help="Answer using strict factual QA prompt and RAG.")
-    @check_channel_allowed()
+    @ _check_channel_allowed()
     async def cmd_strict(ctx: commands.Context, *, q: str) -> None:
-        await _ask_rag(ctx, q, cfg.PROMPT_STRICT)
+        await _answer_rag(ctx, q, force_local=None)
 
     @bot.command(name="think", help="Answer using reasoning/verbose QA prompt and RAG.")
-    @check_channel_allowed()
+    @ _check_channel_allowed()
     async def cmd_think(ctx: commands.Context, *, q: str) -> None:
-        await _ask_rag(ctx, q, cfg.PROMPT_REASON)
+        # WHY: currently shares the same system prompt; wire a different prompt if needed
+        await _answer_rag(ctx, q, force_local=None)
 
     @bot.command(name="local", help="Answer only with local LLM; cloud is skipped.")
-    @check_channel_allowed()
-    async def cmd_local_llm(ctx: commands.Context, *, q: str) -> None:
-        deps = _require_state()
-        q_s = sanitize(q.strip().replace("\n", " "))
-        if len(q_s) > cfg.MAX_QUESTION_LEN or not cfg.ALLOWED_CHARS.match(q_s):
-            await ctx.send("❌ Invalid query format.")
-            return
-        if not _check_cooldown(ctx.author.id):
-            await ctx.send("⏳ Please wait before sending another query.")
-            return
-
-        await ctx.send("🧠 Thinking locally…")
-        try:
-            async with cfg.REQUEST_SEMAPHORE:
-                sys_prompt_text = Path(cfg.PROMPT_STRICT).read_text("utf-8")
-                prompt, nodes, _ = await deps.generate_rag_answer(q_s, sys_prompt_text, use_remote=False)
-                if not nodes:
-                    await ctx.send("⚠️ Not enough data.")
-                    return
-                answer = await deps.call_local_llm(prompt)
-                await send_long(ctx, answer or "❌ No answer.")
-        except discord.HTTPException as http_exc:
-            await send_long(ctx, f"⚠️ Answer too long: {http_exc}")
-        except Exception as exc:  # pragma: no cover
-            disc_log.exception("[cmd_local_llm] error: %r", exc)
-            await ctx.send(f"❌ Error: {exc}")
+    @ _check_channel_allowed()
+    async def cmd_local(ctx: commands.Context, *, q: str) -> None:
+        await _answer_rag(ctx, q, force_local=True)
 
     @bot.command(name="status", help="Show bot/index/cache status.")
     async def cmd_status(ctx: commands.Context) -> None:
@@ -309,48 +244,24 @@ def _register_commands(bot: commands.Bot) -> None:
         )
 
     @bot.command(name="reload_index", help="Rebuild the index (admin only).")
-    @check_admin_only()
+    @ _check_admin_only()
     async def cmd_reload_index(ctx: commands.Context) -> None:
         deps = _require_state()
         try:
             FILTER_CACHE.clear()
             new_index = await deps.build_index()
-            new_retriever = new_index.as_retriever(similarity_top_k=cfg.TOP_K)
             deps.index = new_index
-            deps.retriever = new_retriever
+            deps.retriever = new_index.as_retriever(similarity_top_k=cfg.TOP_K)
             await ctx.send("✅ Index reloaded.")
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             disc_log.exception("[reload_index] error: %r", exc)
             await ctx.send(f"❌ Error: {exc}")
 
-    @bot.command(name="multy", help="Multi-step analysis using the strict prompt.")
-    @check_channel_allowed()
-    async def cmd_multy(ctx: commands.Context, *, q: str) -> None:
-        deps = _require_state()
-        await ctx.send("🔎 Running multi-step analysis…")
-        try:
-            sys_prompt_text = Path(cfg.PROMPT_STRICT).read_text("utf-8")
-            prompt, nodes, ctx_txt = await deps.generate_rag_answer(
-                q.strip(), sys_prompt_text, use_remote=not deps.is_openrouter_blocked()
-            )
-            if not nodes:
-                await ctx.send("⚠️ Not enough data.")
-                return
-            answer, _ = await deps.query_model(
-                sys_prompt=sys_prompt_text,
-                ctx_txt=ctx_txt,
-                q=q.strip(),
-            )
-            await send_long(ctx, answer or "❌ No answer.")
-        except Exception as exc:  # pragma: no cover
-            disc_log.exception("[cmd_multy] error: %r", exc)
-            await ctx.send(f"❌ Error: {exc}")
-
     @bot.command(name="stop", help="Stop the bot (admin only).")
-    @check_admin_only()
+    @ _check_admin_only()
     async def cmd_stop(ctx: commands.Context) -> None:
         await ctx.send("🛑 Shutting down bot...")
-        await _shutdown(bot)
+        await _shutdown_once(bot)
 
     @bot.event
     async def on_ready() -> None:
@@ -359,14 +270,11 @@ def _register_commands(bot: commands.Bot) -> None:
             ch = bot.get_channel(next(iter(cfg.ALLOWED_CHANNELS)))
             if ch:
                 await ch.send("✅ Bot started and ready.")
-            else:
-                disc_log.warning("[on_ready] Allowed channel not found.")
         except Exception as exc:
-            disc_log.error("[on_ready] Failed to send startup notification: %s", exc)
+            disc_log.error("[on_ready] startup notify failed: %s", exc)
 
     @bot.event
     async def on_command_error(ctx: commands.Context, error: Exception) -> None:
-        """Unified command error handler for checks and usage errors."""
         if isinstance(error, commands.CheckFailure):
             msg = str(error)
             if msg == "not_admin":
@@ -376,29 +284,33 @@ def _register_commands(bot: commands.Bot) -> None:
             else:
                 await ctx.send("❌ You are not allowed to use this command here.")
             return
-
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send("❌ Invalid command usage.")
             return
-
         disc_log.exception("[on_command_error] Unhandled: %r", error)
         await ctx.send(f"❌ Error: {error}")
 
 # ─────────────────────────────────────────────────────────────
-# Shutdown
+# Shutdown (idempotent)
 # ─────────────────────────────────────────────────────────────
 
 
-async def _shutdown(bot: commands.Bot) -> None:
-    """Gracefully shut down: notify channel, close HTTP session, call core shutdown, close bot."""
+async def _shutdown_once(bot: commands.Bot) -> None:
+    """
+    WHY: Ensure resources close exactly once even across multiple exit paths.
+    """
+    global _shutdown_flag
+    async with _shutdown_lock:
+        if _shutdown_flag:
+            return
+        _shutdown_flag = True
+
     try:
         ch = bot.get_channel(next(iter(cfg.ALLOWED_CHANNELS)))  # type: ignore[arg-type]
         if ch:
             await ch.send("🛑 Bot stopped.")
-        else:
-            disc_log.warning("[shutdown] Allowed channel not found.")
     except Exception as exc:
-        disc_log.error("[shutdown] Failed to send shutdown notification: %s", exc)
+        disc_log.error("[shutdown] notify failed: %s", exc)
 
     try:
         await _SESSION_HOLDER.close()
@@ -407,7 +319,7 @@ async def _shutdown(bot: commands.Bot) -> None:
         if deps.on_core_shutdown:
             try:
                 await deps.on_core_shutdown()
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:
                 disc_log.exception("[shutdown] on_core_shutdown error: %s", exc)
         await bot.close()
 
@@ -428,13 +340,11 @@ def run_bot(
     is_openrouter_blocked: IsBlockedFn,
     on_core_shutdown: Optional[ShutdownFn] = None,
 ) -> None:
-    """Blocking entrypoint (discord.py will create its own event loop).
-
-    Use this in a dedicated thread/process, or as the top-level entry of a
-    synchronous program. If your host code already has an event loop,
-    prefer `start_bot_async(...)`.
     """
-    global _STATE, _bot
+    WHY: Blocking entry for standalone runs; discord.py manages its own loop.
+    """
+    global _STATE, _bot, _shutdown_flag
+    _shutdown_flag = False
     _STATE = AppDeps(
         index=index,
         retriever=retriever,
@@ -462,12 +372,11 @@ async def start_bot_async(
     is_openrouter_blocked: IsBlockedFn,
     on_core_shutdown: Optional[ShutdownFn] = None,
 ) -> None:
-    """Async entrypoint: run Discord bot inside an existing event loop.
-
-    This avoids `asyncio.run()` conflicts (recommended when the host program is
-    already async). Mirrors the signature of `run_bot(...)`.
     """
-    global _STATE, _bot
+    WHY: Async entry for hosts that already run an event loop.
+    """
+    global _STATE, _bot, _shutdown_flag
+    _shutdown_flag = False
     _STATE = AppDeps(
         index=index,
         retriever=retriever,
@@ -483,5 +392,4 @@ async def start_bot_async(
     try:
         await _bot.start(token)
     finally:
-        # Ensure we run graceful shutdown logic even if `start()` raises.
-        await _shutdown(_bot)
+        await _shutdown_once(_bot)

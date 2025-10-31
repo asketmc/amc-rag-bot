@@ -2,4 +2,9 @@
 parsed/
 logs/
 rag_cache/
-bot/__pycache__/
+**/__pycache__/
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
