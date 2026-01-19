@@ -19,7 +19,7 @@ import importlib
 import sys
 import types
 from dataclasses import dataclass
-from typing import List
+from typing import Any, Iterable, List
 
 import pytest
 
@@ -59,6 +59,24 @@ def rerank_mod(monkeypatch):
     if "sentence_transformers" not in sys.modules:
         st = types.ModuleType("sentence_transformers")
         sys.modules["sentence_transformers"] = st
+    else:
+        st = sys.modules["sentence_transformers"]
+
+    if not hasattr(st, "CrossEncoder"):
+
+        class _CrossEncoder:  # pragma: no cover
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def predict(self, pairs: Iterable[Any], **kwargs: Any):
+                # Deterministic stub: one score per pair
+                try:
+                    n = len(pairs)  # type: ignore[arg-type]
+                except Exception:
+                    n = sum(1 for _ in pairs)
+                return [0.0] * n
+
+        st.CrossEncoder = _CrossEncoder
 
     # ---- stub llama_index.core.schema.NodeWithScore if rerank imports it ----
     # Some code paths may type-check or import it; keep it minimal.
