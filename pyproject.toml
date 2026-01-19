@@ -203,7 +203,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "pytest-asyncio"
+    "pytest-asyncio",
+    "pylint>=3.0,<4"
 ]
 gpu = [
     "torch==2.1.0+cu118",
