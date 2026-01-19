@@ -3,6 +3,8 @@
 ![LLM](https://img.shields.io/badge/LLM-Ollama%20%7C%20Llama3-orange)
 ![Discord](https://img.shields.io/badge/Discord-Bot-informational)
 ![NLP](https://img.shields.io/badge/NLP-Stanza%20%7C%20spaCy-purple)
+![CI](https://img.shields.io/badge/CI-GitHub%20Actions-blue)
+
 
 # Asketmc RAG Discord Bot
 
@@ -195,6 +197,17 @@ LLM/
    ├─ logs/                   # rotating logs (app/error/rag/…)
    └─ rag_cache/              # indices/cache (runtime)
 ```
+
+---
+
+---
+
+## CI
+
+* GitHub Actions workflow: `.github/workflows/python-app.yml`
+* Triggers: `push` and `pull_request` on branch `master`
+* Test command: `python -m pytest -q`
+* Current test suite: 89 tests total (85 passed, 4 skipped)
 
 ---
 
