@@ -46,7 +46,13 @@ dependencies = [
     "docopt==0.6.2",
     "durationpy==0.10",
     "emoji==2.14.1",
-    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85",
+
+    # Keep numpy 1.26.x: use spaCy 3.7.x + thinc 8.2.x (spaCy 3.8+ pulls thinc 8.3+ which requires numpy>=2)
+    "spacy==3.7.5",
+    "thinc==8.2.5",
+    "typer==0.9.4",
+    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl",
+
     "exceptiongroup==1.3.0",
     "fastapi==0.115.9",
     "filelock==3.18.0",
@@ -176,7 +182,6 @@ dependencies = [
     "smart-open==7.1.0",
     "sniffio==1.3.1",
     "soupsieve==2.7",
-    "spacy==3.8.7",
     "spacy-legacy==3.0.12",
     "spacy-loggers==1.0.5",
     "SQLAlchemy==2.0.41",
@@ -186,7 +191,6 @@ dependencies = [
     "striprtf==0.0.26",
     "sympy==1.14.0",
     "tenacity==8.5.0",
-    "thinc==8.3.6",
     "threadpoolctl==3.6.0",
     "tiktoken==0.9.0",
     "tokenizers==0.19.1",
@@ -197,7 +201,6 @@ dependencies = [
     "torchvision==0.16.0",
     "tqdm==4.67.1",
     "transformers==4.40.2",
-    "typer==0.16.0",
     "typing-inspect==0.9.0",
     "typing-inspection==0.4.1",
     "typing_extensions==4.14.0",
