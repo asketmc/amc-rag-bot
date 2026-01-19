@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-parse_mobs.py — Grimoire of Gaia mobs parser (Python 3.10+)
+parse_mobs.py — Grimoire of Gaia mobs parser (Python 3.10)
 
 Purpose:
   Parse Grimoire of Gaia mob JSON files and generate a deterministic text report:
