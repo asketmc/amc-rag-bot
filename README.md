@@ -207,7 +207,7 @@ LLM/
 * GitHub Actions workflow: `.github/workflows/python-app.yml`
 * Triggers: `push` and `pull_request` on branch `master`
 * Test command: `python -m pytest -q`
-* Current test suite: 89 tests total (85 passed, 4 skipped)
+* Current test suite: 84 tests total (84 passed)
 
 ---
 
