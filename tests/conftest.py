@@ -1,3 +1,4 @@
+# FILE: tests/conftest.py
 from __future__ import annotations
 
 import os
@@ -5,6 +6,7 @@ import sys
 import types
 import traceback
 from pathlib import Path
+from typing import Any
 
 
 def _dbg_enabled() -> bool:
@@ -42,6 +44,33 @@ def _module_origin(name: str) -> str:
     return f"file={f!r} path={list(p) if p is not None else None!r} type={type(mod)!r}"
 
 
+def _install_failfast_stub(module_name: str, *, attrs: dict[str, Any] | None = None) -> None:
+    """
+    Import stub that allows module import but fails loudly if actually used.
+    Good for fast CI where we want logic tests, not heavy integration.
+    """
+    if module_name in sys.modules:
+        _dbg(module_name, "already present:", _module_origin(module_name))
+        return
+
+    m = types.ModuleType(module_name)
+    m.__dict__["__version__"] = "0"
+
+    def _fail(*_a: Any, **_kw: Any) -> None:
+        raise RuntimeError(f"Stubbed dependency '{module_name}' was used in tests. Install real deps or disable stubs.")
+
+    # Provide common call sites as fail-fast
+    m.__dict__.setdefault("load", _fail)
+    m.__dict__.setdefault("Client", _fail)
+    m.__dict__.setdefault("OpenAI", _fail)
+
+    if attrs:
+        m.__dict__.update(attrs)
+
+    sys.modules[module_name] = m
+    _dbg("stubbed", module_name)
+
+
 def _install_rerank_stub() -> None:
     """
     Prevent heavy reranker initialization during unit tests.
@@ -67,7 +96,6 @@ def _install_rerank_stub() -> None:
     rerank_mod.shutdown_reranker = shutdown_reranker
 
     sys.modules["asketmc_bot.rerank"] = rerank_mod
-    # Optional compatibility if any code imports plain "rerank"
     if "rerank" not in sys.modules:
         sys.modules["rerank"] = rerank_mod
 
@@ -76,6 +104,14 @@ def _install_rerank_stub() -> None:
 
 def _install_stub_modules() -> None:
     _dbg("install stubs: begin")
+
+    # Heavy deps commonly imported at module import-time
+    _install_failfast_stub("chromadb")
+    _install_failfast_stub("spacy")
+    _install_failfast_stub("transformers")
+    _install_failfast_stub("openai")
+    _install_failfast_stub("ollama")
+    _install_failfast_stub("onnxruntime")
 
     # torch stub (avoid CUDA checks / heavy import)
     if "torch" not in sys.modules:
@@ -99,7 +135,6 @@ def _install_stub_modules() -> None:
     _install_rerank_stub()
 
     # llama_index minimal surface used by some modules
-    # Only stub if llama_index is not already importable / installed.
     _dbg("attempt import llama_index with current sys.modules state")
     _dbg(
         "pre-import origins:",
@@ -161,7 +196,6 @@ def _install_stub_modules() -> None:
         ll_schema.NodeWithScore = NodeWithScore
         sys.modules["llama_index.core.schema"] = ll_schema
 
-    # Avoid clobbering real schema if it becomes available later.
     if not hasattr(ll_core, "schema"):
         ll_core.schema = sys.modules["llama_index.core.schema"]
 
