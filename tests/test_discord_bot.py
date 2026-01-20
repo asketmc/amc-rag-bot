@@ -18,12 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src" / "asketmc_bot"))
 
 # Mock discord before importing
-sys.modules['discord'] = Mock()
-sys.modules['discord.ext'] = Mock()
-sys.modules['discord.ext.commands'] = Mock()
-sys.modules['aiohttp'] = Mock()
+sys.modules["discord"] = Mock()
+sys.modules["discord.ext"] = Mock()
+sys.modules["discord.ext.commands"] = Mock()
+sys.modules["aiohttp"] = Mock()
 
-import discord_bot
+from asketmc_bot import discord_bot
 
 
 class TestInputSanitization:
@@ -169,7 +169,7 @@ class TestBotBuilder:
 
     def test_build_bot_creates_bot_instance(self):
         """_build_bot creates a bot with proper intents."""
-        with patch('discord_bot.commands.Bot') as mock_bot_cls:
+        with patch("asketmc_bot.discord_bot.commands.Bot") as mock_bot_cls:
             mock_bot_cls.return_value = Mock()
 
             bot = discord_bot._build_bot()
@@ -177,8 +177,8 @@ class TestBotBuilder:
             mock_bot_cls.assert_called_once()
             # Verify intents were configured
             call_kwargs = mock_bot_cls.call_args[1]
-            assert 'intents' in call_kwargs
-            assert 'command_prefix' in call_kwargs
+            assert "intents" in call_kwargs
+            assert "command_prefix" in call_kwargs
 
     def test_command_registration(self):
         """Commands are registered on bot."""
@@ -188,6 +188,7 @@ class TestBotBuilder:
         def mock_command(**kwargs):
             def decorator(func):
                 return func
+
             return decorator
 
         mock_bot.command = mock_command
@@ -209,14 +210,14 @@ class TestAdminCommandChecks:
 
     def test_admin_check_allows_admin(self):
         """Admin user passes admin check."""
-        with patch('discord_bot.cfg.ADMIN_IDS', {123}):
+        with patch("asketmc_bot.discord_bot.cfg.ADMIN_IDS", {123}):
             check_decorator = discord_bot._check_admin_only()
             # Get the actual predicate function
             # (Complex due to decorator structure, simplified test)
 
     def test_admin_check_blocks_non_admin(self):
         """Non-admin user fails admin check."""
-        with patch('discord_bot.cfg.ADMIN_IDS', {123}):
+        with patch("asketmc_bot.discord_bot.cfg.ADMIN_IDS", {123}):
             check_decorator = discord_bot._check_admin_only()
             # Would need to create mock context to fully test
 
@@ -238,10 +239,13 @@ class TestSessionHolder:
         """Session holder creates session on first access."""
         holder = discord_bot._AsyncSessionHolder()
 
-        with patch('discord_bot.ClientSession') as mock_session_cls:
+        with patch("asketmc_bot.discord_bot.ClientSession") as mock_session_cls, patch(
+                "asketmc_bot.discord_bot.TCPConnector"
+        ) as mock_connector_cls:
             mock_session = AsyncMock()
             mock_session.closed = False
             mock_session_cls.return_value = mock_session
+            mock_connector_cls.return_value = Mock()
 
             session = await holder.get()
             mock_session_cls.assert_called_once()
@@ -253,15 +257,17 @@ class TestSessionHolder:
         """Session holder reuses open session."""
         holder = discord_bot._AsyncSessionHolder()
 
-        with patch('discord_bot.ClientSession') as mock_session_cls:
+        with patch("asketmc_bot.discord_bot.ClientSession") as mock_session_cls, patch(
+                "asketmc_bot.discord_bot.TCPConnector"
+        ) as mock_connector_cls:
             mock_session = AsyncMock()
             mock_session.closed = False
             mock_session_cls.return_value = mock_session
+            mock_connector_cls.return_value = Mock()
 
             session1 = await holder.get()
             session2 = await holder.get()
 
-            # Should only create once
             assert mock_session_cls.call_count == 1
 
         await holder.close()
@@ -271,11 +277,14 @@ class TestSessionHolder:
         """Session holder closes session on close()."""
         holder = discord_bot._AsyncSessionHolder()
 
-        with patch('discord_bot.ClientSession') as mock_session_cls:
+        with patch("asketmc_bot.discord_bot.ClientSession") as mock_session_cls, patch(
+                "asketmc_bot.discord_bot.TCPConnector"
+        ) as mock_connector_cls:
             mock_session = AsyncMock()
             mock_session.closed = False
             mock_session.close = AsyncMock()
             mock_session_cls.return_value = mock_session
+            mock_connector_cls.return_value = Mock()
 
             await holder.get()
             await holder.close()

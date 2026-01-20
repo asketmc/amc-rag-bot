@@ -1,4 +1,3 @@
-# src/asketmc_bot/main.py
 #!/usr/bin/env python3
 """Asketmc RAG Bot — async entry point.
 
@@ -18,18 +17,19 @@ import os
 import signal
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 from llama_index.core import VectorStoreIndex
 
-# Local imports
-import config as cfg
-import discord_bot as discord_module
-from index_builder import build_index
-from lemma import LEMMA_POOL, extract_lemmas
-from llm_client import LLMClient, LLMConfig
-from rag_filter import build_context, get_filtered_nodes
-from rerank import init_reranker, rerank, shutdown_reranker
+# Local imports (src-layout safe)
+from asketmc_bot import config as cfg
+from asketmc_bot import discord_bot as discord_module
+from asketmc_bot.index_builder import build_index
+from asketmc_bot.lemma import LEMMA_POOL, extract_lemmas
+from asketmc_bot.llm_client import LLMClient, LLMConfig
+from asketmc_bot.rag_filter import build_context, get_filtered_nodes
+from asketmc_bot.rerank import init_reranker, rerank, shutdown_reranker
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -56,7 +56,7 @@ def load_settings() -> dict:
         project_root / ".env",
         project_root / ".env.local",
         project_root / ".env-example",
-    ]
+        ]
     env_loaded = False
     for env_path in candidates:
         if env_path.exists():
@@ -109,15 +109,15 @@ def make_llm_config(s: dict) -> LLMConfig:
 
 # ── Core RAG logic ────────────────────────────────────────────────────────────
 async def generate_rag_answer(
-    retriever,
-    query: str,
-    sys_prompt: str,
-    llm_client: LLMClient,
-    settings: dict,
-    **kwargs,
+        retriever: Any,
+        query: str,
+        sys_prompt: str,
+        llm_client: LLMClient,
+        settings: dict,
+        **kwargs: Any,
 ) -> str:
     """Build a RAG prompt and generate an answer via the LLM."""
-    use_remote = kwargs.get("use_remote", None)
+    use_remote = kwargs.get("use_remote", True)
 
     qlem = extract_lemmas(query)
     raw_nodes = await retriever.aretrieve(query)
@@ -127,7 +127,7 @@ async def generate_rag_answer(
     if not nodes:
         return "⚠️ Not enough data."
 
-    char_limit = settings["ctx_len_remote"]
+    char_limit = settings["ctx_len_remote"] if use_remote else settings["ctx_len_local"]
     ctx_txt = build_context(nodes, qlem, char_limit)
 
     if not use_remote:
@@ -162,8 +162,15 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     llm.attach_loop(loop)
 
+    _shutdown_started = False
+
     async def shutdown() -> None:
         """Graceful async shutdown for core services."""
+        nonlocal _shutdown_started
+        if _shutdown_started:
+            return
+        _shutdown_started = True
+
         log.info("Shutting down core systems...")
         try:
             await shutdown_reranker()
@@ -201,9 +208,19 @@ async def main() -> None:
         )
     )
 
+    # If bot task crashes, trigger shutdown to avoid hanging forever.
+    def _bot_done(t: asyncio.Task) -> None:
+        try:
+            _ = t.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            asyncio.create_task(shutdown())
+
+    bot_task.add_done_callback(_bot_done)
+
     # Signal handling
-    def _signal_handler(*args) -> None:
-        """Signal handler that creates shutdown task. Args ignored."""
+    def _signal_handler() -> None:
         asyncio.create_task(shutdown())
 
     for sig_name in ("SIGINT", "SIGTERM"):
@@ -216,7 +233,8 @@ async def main() -> None:
     await stop_event.wait()
 
     # Cancel bot gracefully
-    bot_task.cancel()
+    if not bot_task.done():
+        bot_task.cancel()
     try:
         await bot_task
     except asyncio.CancelledError:

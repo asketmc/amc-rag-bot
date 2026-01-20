@@ -1,8 +1,8 @@
 #!/usr/bin/env python3.10
 """
-lemma.py — лемматизатор (stanza/spaCy) и кэш лемм для файлов/чанков.
+lemma.py — lemmatizer (stanza/spaCy) and lemma caches for files/chunks.
 
-Экспортируемое API:
+Exported API:
 - extract_lemmas(text: str) -> FrozenSet[str]
 - FILE_LEMMAS: Dict[str, FrozenSet[str]]
 - CHUNK_LEMMA_CACHE: Dict[str, FrozenSet[str]]
@@ -11,7 +11,12 @@ lemma.py — лемматизатор (stanza/spaCy) и кэш лемм для �
 - save_chunk_lemma_cache(...)
 - load_saved_lemmas()
 - update_file_lemmas_async(docs, stored_hashes, new_hashes)
-- LEMMA_POOL (ThreadPoolExecutor) — для корректного shutdown в core
+- LEMMA_POOL (ThreadPoolExecutor) — for controlled shutdown if needed
+
+Notes:
+- No model downloads or heavy initialization at import time.
+- Model init is lazy and failure-tolerant.
+- Cache files are stored under cfg.CACHE_PATH.
 """
 
 from __future__ import annotations
@@ -24,62 +29,158 @@ import json
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, FrozenSet, List
+from typing import Dict, FrozenSet, List, Optional
 
 # Third-party
-import stanza
 import spacy
+import stanza
 from langdetect import detect
 from langdetect.lang_detect_exception import LangDetectException
 
 # Local
-import config as cfg
+from asketmc_bot import config as cfg
 
 log = logging.getLogger("asketmc.lemma")
 log.setLevel(logging.DEBUG if getattr(cfg, "DEBUG", False) else logging.INFO)
 
 # ─────────────────────────────────────────────────────────
-# Инициализация моделей (stanza + spaCy)
+# Caches (stored under cfg.CACHE_PATH)
 # ─────────────────────────────────────────────────────────
-log.info("[LEMMATIZER] Preparing models...")
-try:
-    stanza.download('ru', verbose=False)
-    log.info("[LEMMATIZER] stanza ru downloaded/ready")
-except Exception as e:
-    log.exception("[LEMMATIZER] stanza download error: %s", e)
-    raise SystemExit(1)
+CHUNK_LEMMA_CACHE_FILE: Path = cfg.CACHE_PATH / "chunk_lemma_index.json"
+LEMMA_INDEX_FILE: Path = cfg.CACHE_PATH / "lemma_index.json"
 
-try:
-    STANZA_NLP_RU = stanza.Pipeline(
-        lang='ru',
-        processors='tokenize,pos,lemma',
-        use_gpu=False,
-        verbose=False,
-    )
-    log.info("[LEMMATIZER] stanza pipeline ready")
-except Exception as e:
-    log.exception("[LEMMATIZER] stanza pipeline error: %s", e)
-    raise SystemExit(1)
+CHUNK_LEMMA_CACHE: Dict[str, FrozenSet[str]] = {}
+FILE_LEMMAS: Dict[str, FrozenSet[str]] = {}
 
-try:
-    SPACY_EN = spacy.load("en_core_web_sm")
-    log.info("[LEMMATIZER] spaCy en_core_web_sm ready")
-except Exception as e:
-    log.exception("[LEMMATIZER] spaCy load error: %s", e)
-    raise SystemExit(1)
-
-# Пул и мьютекс
+# ─────────────────────────────────────────────────────────
+# Pool and locks
+# ─────────────────────────────────────────────────────────
 _LEMMA_LOCK = threading.Lock()
+_MODELS_INIT_LOCK = threading.Lock()
 LEMMA_POOL = ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 8))
-log.info("[LEMMATIZER] ThreadPoolExecutor started (max_workers=%d)", getattr(LEMMA_POOL, "_max_workers", 0))
 
 # ─────────────────────────────────────────────────────────
-# Лемматизация
+# Lazy model initialization
+# ─────────────────────────────────────────────────────────
+_STANZA_NLP_RU: Optional[stanza.Pipeline] = None
+_SPACY_EN = None
+_MODELS_INIT_TRIED = False
+_MODELS_AVAILABLE = False
+
+# Degraded-mode reporting / retry gate
+_DEGRADED_WARNED = False
+_LAST_INIT_ATTEMPT_TS = 0.0
+_INIT_RETRY_COOLDOWN_SEC = float(getattr(cfg, "LEMMA_INIT_RETRY_COOLDOWN_SEC", 300.0))
+
+
+def _try_init_models(*, force_retry: bool = False) -> bool:
+    """
+    Lazily initialize stanza + spaCy models.
+
+    No downloads are triggered here.
+    If models are missing/unavailable, returns False and lemmatization degrades to empty sets.
+
+    Thread-safety:
+    - Single initializer under _MODELS_INIT_LOCK.
+
+    Retry behavior:
+    - If init previously failed, allow a throttled retry (cooldown) or explicit force_retry.
+    """
+    global _STANZA_NLP_RU, _SPACY_EN, _MODELS_INIT_TRIED, _MODELS_AVAILABLE
+    global _LAST_INIT_ATTEMPT_TS
+
+    now = time.time()
+
+    if _MODELS_INIT_TRIED and _MODELS_AVAILABLE:
+        return True
+
+    if _MODELS_INIT_TRIED and not _MODELS_AVAILABLE and not force_retry:
+        if (now - _LAST_INIT_ATTEMPT_TS) < _INIT_RETRY_COOLDOWN_SEC:
+            return False
+
+    with _MODELS_INIT_LOCK:
+        now = time.time()
+
+        if _MODELS_INIT_TRIED and _MODELS_AVAILABLE:
+            return True
+
+        if _MODELS_INIT_TRIED and not _MODELS_AVAILABLE and not force_retry:
+            if (now - _LAST_INIT_ATTEMPT_TS) < _INIT_RETRY_COOLDOWN_SEC:
+                return False
+
+        _LAST_INIT_ATTEMPT_TS = now
+
+        spacy_en = None
+        stanza_ru = None
+
+        # spaCy EN
+        try:
+            spacy_en = spacy.load("en_core_web_sm")
+            log.info("[LEMMATIZER] spaCy en_core_web_sm ready")
+        except Exception as e:
+            spacy_en = None
+            log.warning("[LEMMATIZER] spaCy model not available: %s", e)
+
+        # stanza RU (expects resources already installed in stanza's default dir)
+        try:
+            stanza_ru = stanza.Pipeline(
+                lang="ru",
+                processors="tokenize,pos,lemma",
+                use_gpu=False,
+                verbose=False,
+            )
+            log.info("[LEMMATIZER] stanza ru pipeline ready")
+        except Exception as e:
+            stanza_ru = None
+            log.warning("[LEMMATIZER] stanza resources/pipeline not available: %s", e)
+
+        models_available = (spacy_en is not None) or (stanza_ru is not None)
+        if not models_available:
+            log.warning(
+                "[LEMMATIZER] No NLP models available; lemmatization degraded (empty lemma sets). "
+                "Will retry after cooldown=%.0fs.",
+                _INIT_RETRY_COOLDOWN_SEC,
+            )
+
+        _SPACY_EN = spacy_en
+        _STANZA_NLP_RU = stanza_ru
+        _MODELS_AVAILABLE = models_available
+        _MODELS_INIT_TRIED = True
+
+        return _MODELS_AVAILABLE
+
+
+def _notify_degraded_once() -> None:
+    global _DEGRADED_WARNED
+    if _DEGRADED_WARNED:
+        return
+    _DEGRADED_WARNED = True
+    log.warning(
+        "[LEMMATIZER] Lemmatization is running in degraded mode (no NLP models). "
+        "Ensure spaCy model 'en_core_web_sm' and/or stanza Russian resources are installed. "
+        "Lemmas will be empty until models become available."
+    )
+
+
+# ─────────────────────────────────────────────────────────
+# Lemmatization
 # ─────────────────────────────────────────────────────────
 @functools.lru_cache(maxsize=10_000)
 def _extract_lemmas(text: str) -> FrozenSet[str]:
+    # Fast path: skip empty / too short
+    if not text or len(text) < 3:
+        return frozenset()
+
+    # Best-effort init; if failed, emit a single warning and occasionally retry via _try_init_models.
+    if not _try_init_models():
+        _notify_degraded_once()
+        # Throttled retry gate lives in _try_init_models itself, so no extra logic here.
+        return frozenset()
+
+    # Language detection (best-effort)
     try:
         detected_lang = detect(text)
     except LangDetectException:
@@ -90,8 +191,12 @@ def _extract_lemmas(text: str) -> FrozenSet[str]:
     lang = "en" if detected_lang == "en" else "ru"
 
     if lang == "en":
+        if _SPACY_EN is None:
+            # If spaCy specifically missing, try a forced retry occasionally (still throttled by lock/cooldown).
+            _try_init_models(force_retry=False)
+            return frozenset()
         try:
-            doc = SPACY_EN(text)
+            doc = _SPACY_EN(text)
             lemmas = {
                 tok.lemma_.lower()
                 for tok in doc
@@ -102,9 +207,15 @@ def _extract_lemmas(text: str) -> FrozenSet[str]:
             return frozenset()
 
     # ru
+    if _STANZA_NLP_RU is None:
+        # If stanza specifically missing, allow cooldown-based retries.
+        _try_init_models(force_retry=False)
+        return frozenset()
+
     try:
+        # Stanza pipeline is not thread-safe in many setups; serialize calls.
         with _LEMMA_LOCK:
-            doc = STANZA_NLP_RU(text)
+            doc = _STANZA_NLP_RU(text)
     except Exception:
         return frozenset()
 
@@ -122,25 +233,16 @@ def _extract_lemmas(text: str) -> FrozenSet[str]:
     except Exception:
         return frozenset()
 
-# Публичный алиас
+
+# Public alias
 extract_lemmas = _extract_lemmas
 
-# ─────────────────────────────────────────────────────────
-# Кэш лемм: для чанков и для файлов
-# ─────────────────────────────────────────────────────────
-CHUNK_LEMMA_CACHE_FILE = Path("rag_cache/chunk_lemma_index.json")
-CHUNK_LEMMA_CACHE: Dict[str, FrozenSet[str]] = {}
-
-FILE_LEMMAS: Dict[str, FrozenSet[str]] = {}
-LEMMA_INDEX_FILE = Path("rag_cache/lemma_index.json")
 
 def _chunk_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+
 def get_lemmas_for_chunk(text: str) -> FrozenSet[str]:
-    """
-    (Опционально — если когда-либо потребуется напрямую)
-    """
     h = _chunk_hash(text)
     lemmas = CHUNK_LEMMA_CACHE.get(h)
     if lemmas is None:
@@ -151,24 +253,33 @@ def get_lemmas_for_chunk(text: str) -> FrozenSet[str]:
         CHUNK_LEMMA_CACHE[h] = lemmas
     return lemmas
 
+
 def save_chunk_lemma_cache(chunk_cache_file: Path = CHUNK_LEMMA_CACHE_FILE) -> None:
     data = {k: list(v) for k, v in CHUNK_LEMMA_CACHE.items()}
     try:
         chunk_cache_file.parent.mkdir(parents=True, exist_ok=True)
-        chunk_cache_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        chunk_cache_file.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         log.info("[LEMMA_CACHE] Chunk cache saved: %s (keys=%d)", chunk_cache_file, len(data))
     except Exception as e:
         log.error("[LEMMA_CACHE] Save error: %s", e)
 
-def _persist_lemmas(lemma_file: Path = None) -> None:
+
+def _persist_lemmas(lemma_file: Optional[Path] = None) -> None:
     lemma_file = lemma_file or LEMMA_INDEX_FILE
     try:
         lemma_file.parent.mkdir(parents=True, exist_ok=True)
         dump = {k: list(v) for k, v in FILE_LEMMAS.items()}
-        lemma_file.write_text(json.dumps(dump, ensure_ascii=False, indent=2), encoding="utf-8")
+        lemma_file.write_text(
+            json.dumps(dump, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         log.info("[LEMMA_CACHE] File-lemmas saved: %s (files=%d)", lemma_file, len(FILE_LEMMAS))
     except Exception as e:
         log.error("[LEMMA_CACHE] Persist lemmas error: %s", e)
+
 
 def load_saved_lemmas() -> None:
     if not LEMMA_INDEX_FILE.exists():
@@ -182,8 +293,9 @@ def load_saved_lemmas() -> None:
     except Exception as e:
         log.warning("[LEMMA_CACHE] Load lemmas error: %s", e)
 
+
 # ─────────────────────────────────────────────────────────
-# Асинхронное обновление FILE_LEMMAS по изменившимся файлам
+# Async update of FILE_LEMMAS for changed files
 # ─────────────────────────────────────────────────────────
 def _read_file(fp: Path) -> str:
     try:
@@ -191,9 +303,10 @@ def _read_file(fp: Path) -> str:
     except Exception:
         return ""
 
+
 async def _compute_and_store_lemmas(fp: Path) -> None:
-    loop = asyncio.get_event_loop()
-    text = await loop.run_in_executor(None, _read_file, fp)
+    loop = asyncio.get_running_loop()
+    text = await loop.run_in_executor(LEMMA_POOL, _read_file, fp)
     try:
         FILE_LEMMAS[fp.name] = extract_lemmas(text)
         log.debug("[LEMMA_CACHE] %s: %d lemmas", fp.name, len(FILE_LEMMAS[fp.name]))
@@ -201,15 +314,17 @@ async def _compute_and_store_lemmas(fp: Path) -> None:
         FILE_LEMMAS[fp.name] = frozenset()
         log.debug("[LEMMA_CACHE] %s: set empty (error)", fp.name)
 
+
 async def update_file_lemmas_async(
-    docs: List[Path],
-    stored_hashes: Dict[str, str],
-    new_hashes: Dict[str, str]
+        docs: List[Path],
+        stored_hashes: Dict[str, str],
+        new_hashes: Dict[str, str],
 ) -> List[Path]:
     changed = [d for d in docs if stored_hashes.get(d.name) != new_hashes.get(d.name)]
     if not changed:
         log.info("[LEMMA_CACHE] No changed files")
         return []
+
     tasks = [asyncio.create_task(_compute_and_store_lemmas(d)) for d in changed]
     await asyncio.gather(*tasks)
     _persist_lemmas()

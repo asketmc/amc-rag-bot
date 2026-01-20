@@ -6,262 +6,289 @@ Tests for LLMClient (P1 Critical Feature)
 - Remote/local fallback
 - Query model validation
 - Session management
+- Cross-thread sync breaker check
 """
-import pytest
+from __future__ import annotations
+
 import asyncio
-from unittest.mock import AsyncMock, Mock, patch
-from dataclasses import dataclass
-import sys
+import queue
+import threading
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 
-# Add src to path
+import pytest
+
+# Ensure src is importable
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src" / "asketmc_bot"))
+SRC = ROOT / "src"
+if str(SRC) not in asyncio.sys.path:  # type: ignore[attr-defined]
+    # Avoid importing sys at module scope into a test that also uses asyncio.sys in type-checkers.
+    import sys as _sys
 
-from llm_client import LLMClient, LLMConfig, CircuitBreaker, AsyncSessionHolder
+    if str(SRC) not in _sys.path:
+        _sys.path.insert(0, str(SRC))
+
+import asketmc_bot.llm_client as llm_mod  # noqa: E402
+from asketmc_bot.llm_client import (  # noqa: E402
+    AsyncSessionHolder,
+    CircuitBreaker,
+    LLMClient,
+    LLMConfig,
+)
 
 
-pytestmark = pytest.mark.asyncio
+@pytest.fixture
+def config() -> LLMConfig:
+    return LLMConfig(
+        api_url="https://test.example/api",
+        or_model="test/model",
+        or_max_tokens=128,
+        openrouter_api_key="test_key",
+        ollama_url="http://localhost:11434/api/generate",
+        local_model="test:local",
+        http_conn_limit=2,
+        or_retries=2,
+        http_timeout_total=10,
+        breaker_base_block_sec=1,
+        breaker_max_block_sec=5,
+    )
+
+
+class _FakeClock:
+    def __init__(self, start: float = 1_000_000.0) -> None:
+        self.t = float(start)
+
+    def now(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += float(dt)
 
 
 class TestCircuitBreaker:
-    """Test circuit breaker state transitions and blocking logic."""
-
+    @pytest.mark.asyncio
     async def test_initial_state_closed(self):
-        """Circuit breaker starts in closed state, allowing requests."""
         breaker = CircuitBreaker(base_block=1, max_block=10)
         assert await breaker.state() == "closed"
         assert await breaker.allow() is True
 
-    async def test_failure_opens_breaker(self):
-        """Failure transitions breaker to open state."""
+    @pytest.mark.asyncio
+    async def test_failure_opens_breaker_and_blocks_until_timeout(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(llm_mod.time, "time", clock.now)
+
         breaker = CircuitBreaker(base_block=1, max_block=10)
+
         await breaker.on_failure()
         assert await breaker.state() == "open"
         assert await breaker.allow() is False
 
-    async def test_success_resets_breaker(self):
-        """Success resets breaker to closed and resets block time."""
+        clock.advance(1.01)
+        assert await breaker.allow() is True
+        assert await breaker.state() == "half_open"
+
+    @pytest.mark.asyncio
+    async def test_success_resets_breaker(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(llm_mod.time, "time", clock.now)
+
         breaker = CircuitBreaker(base_block=2, max_block=10)
+
         await breaker.on_failure()
         assert await breaker.state() == "open"
 
-        await asyncio.sleep(1.1)  # wait for half-open
-        await breaker.allow()  # transition to half-open
-        await breaker.on_success(base_block=2)
+        clock.advance(2.01)
+        assert await breaker.allow() is True
+        assert await breaker.state() == "half_open"
 
+        await breaker.on_success(base_block=2)
         assert await breaker.state() == "closed"
         assert await breaker.allow() is True
 
-    async def test_exponential_backoff(self):
-        """Block time doubles on repeated failures."""
-        breaker = CircuitBreaker(base_block=1, max_block=10)
+    @pytest.mark.asyncio
+    async def test_exponential_backoff_respects_max(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(llm_mod.time, "time", clock.now)
 
-        await breaker.on_failure()
-        assert breaker._block == 2  # doubled
-
-        await breaker.on_failure()
-        assert breaker._block == 4  # doubled again
-
-        await breaker.on_failure()
-        assert breaker._block == 8
-
-    async def test_max_block_limit(self):
-        """Block time caps at max_block."""
         breaker = CircuitBreaker(base_block=1, max_block=5)
 
-        for _ in range(10):
-            await breaker.on_failure()
+        await breaker.on_failure()
+        assert breaker._block == 2
 
-        assert breaker._block <= 5
+        await breaker.on_failure()
+        assert breaker._block == 4
+
+        await breaker.on_failure()
+        assert breaker._block == 5
+
+        await breaker.on_failure()
+        assert breaker._block == 5
 
 
 class TestAsyncSessionHolder:
-    """Test session lifecycle and reuse."""
-
-    async def test_session_creation(self):
-        """Session is created on first get."""
+    @pytest.mark.asyncio
+    async def test_session_creation_and_reuse(self):
         holder = AsyncSessionHolder(limit=5, timeout_total=60)
-        session = await holder.get()
-        assert session is not None
-        # Session should be open (closed property should be False)
-        # Note: aiohttp.ClientSession.closed is a property, check it exists
-        assert hasattr(session, 'closed')
-        await holder.close()
 
-    async def test_session_reuse(self):
-        """Same session is returned on subsequent gets."""
-        holder = AsyncSessionHolder(limit=5, timeout_total=60)
-        session1 = await holder.get()
-        session2 = await holder.get()
-        assert session1 is session2
-        await holder.close()
+        mock_session = AsyncMock()
+        mock_session.closed = False
+        mock_session.close = AsyncMock(return_value=None)
 
-    async def test_session_close(self):
-        """Close properly closes the session."""
-        holder = AsyncSessionHolder(limit=5, timeout_total=60)
-        session = await holder.get()
+        with (
+            patch("asketmc_bot.llm_client.ClientSession", return_value=mock_session) as cs,
+            patch("asketmc_bot.llm_client.TCPConnector") as tc,
+            patch("asketmc_bot.llm_client.ClientTimeout") as ct,
+        ):
+            s1 = await holder.get()
+            s2 = await holder.get()
+
+            assert s1 is mock_session
+            assert s2 is mock_session
+            cs.assert_called_once()
+            tc.assert_called_once()
+            ct.assert_called_once()
+
         await holder.close()
-        # After close, session should be closed
-        # (Can't easily test with real aiohttp without mocking)
+        mock_session.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_session_recreated_if_closed(self):
+        holder = AsyncSessionHolder(limit=5, timeout_total=60)
+
+        s1 = AsyncMock()
+        s1.closed = False
+        s1.close = AsyncMock(return_value=None)
+
+        s2 = AsyncMock()
+        s2.closed = False
+        s2.close = AsyncMock(return_value=None)
+
+        with (
+            patch("asketmc_bot.llm_client.ClientSession", side_effect=[s1, s2]) as cs,
+            patch("asketmc_bot.llm_client.TCPConnector"),
+            patch("asketmc_bot.llm_client.ClientTimeout"),
+        ):
+            a = await holder.get()
+            assert a is s1
+
+            s1.closed = True
+            b = await holder.get()
+            assert b is s2
+
+            assert cs.call_count == 2
+
+        await holder.close()
 
 
 class TestLLMClient:
-    """Test LLMClient query logic, fallback, and breaker integration."""
-
-    @pytest.fixture
-    def config(self):
-        """Standard test config."""
-        return LLMConfig(
-            api_url="https://test.example/api",
-            or_model="test/model",
-            or_max_tokens=128,
-            openrouter_api_key="test_key",
-            ollama_url="http://localhost:11434/api/generate",
-            local_model="test:local",
-            http_conn_limit=2,
-            or_retries=2,
-            http_timeout_total=10,
-            breaker_base_block_sec=1,
-            breaker_max_block_sec=5,
-        )
-
+    @pytest.mark.asyncio
     async def test_query_model_requires_input(self, config):
-        """query_model raises ValueError without proper input."""
         client = LLMClient(config)
-
         with pytest.raises(ValueError, match="requires either"):
             await client.query_model()
-
         await client.close()
 
-    async def test_query_model_with_messages(self, config):
-        """query_model accepts prebuilt messages."""
-        client = LLMClient(config)
-
-        with patch.object(client, '_call_openrouter', new_callable=AsyncMock) as mock_or:
-            mock_or.return_value = ("Remote response", None)
-
-            text, fallback = await client.query_model(
-                messages=[{"role": "user", "content": "test"}]
-            )
-
-            assert text == "Remote response"
-            assert fallback is False
-            mock_or.assert_called_once()
-
-        await client.close()
-
-    async def test_query_model_with_components(self, config):
-        """query_model accepts sys_prompt, ctx_txt, q components."""
-        client = LLMClient(config)
-
-        with patch.object(client, '_call_openrouter', new_callable=AsyncMock) as mock_or:
-            mock_or.return_value = ("Remote response", None)
-
-            text, fallback = await client.query_model(
-                sys_prompt="System", ctx_txt="Context", q="Question"
-            )
-
-            assert text == "Remote response"
-            assert fallback is False
-            mock_or.assert_called_once()
-
-        await client.close()
-
+    @pytest.mark.asyncio
     async def test_remote_success_no_fallback(self, config):
-        """Successful remote call doesn't trigger fallback."""
         client = LLMClient(config)
 
-        with patch.object(client, '_call_openrouter', new_callable=AsyncMock) as mock_or:
+        with (
+            patch.object(client, "_call_openrouter", new_callable=AsyncMock) as mock_or,
+            patch.object(client, "call_local_llm", new_callable=AsyncMock) as mock_local,
+        ):
             mock_or.return_value = ("Remote OK", None)
 
-            text, used_fb = await client.query_model(
-                sys_prompt="S", ctx_txt="C", q="Q"
-            )
+            text, used_fb = await client.query_model(sys_prompt="S", ctx_txt="C", q="Q")
 
             assert text == "Remote OK"
             assert used_fb is False
+            mock_local.assert_not_awaited()
 
         await client.close()
 
-    async def test_remote_failure_triggers_local_fallback(self, config):
-        """Remote failure triggers local model fallback."""
+    @pytest.mark.asyncio
+    async def test_remote_failure_triggers_local_fallback_and_breaker(self, config):
         client = LLMClient(config)
 
-        with patch.object(client, '_call_openrouter', new_callable=AsyncMock) as mock_or, \
-             patch.object(client, 'call_local_llm', new_callable=AsyncMock) as mock_local:
-            mock_or.return_value = (None, "transient")  # failure
-            mock_local.return_value = "Local OK"
-
-            text, used_fb = await client.query_model(
-                sys_prompt="S", ctx_txt="C", q="Q"
-            )
-
-            assert "Local OK" in text
-            assert used_fb is True
-            mock_local.assert_called_once()
-
-        await client.close()
-
-    async def test_breaker_blocks_after_failure(self, config):
-        """Circuit breaker blocks remote calls after failure."""
-        client = LLMClient(config)
-
-        with patch.object(client, '_call_openrouter', new_callable=AsyncMock) as mock_or, \
-             patch.object(client, 'call_local_llm', new_callable=AsyncMock) as mock_local:
+        with (
+            patch.object(client, "_call_openrouter", new_callable=AsyncMock) as mock_or,
+            patch.object(client, "call_local_llm", new_callable=AsyncMock) as mock_local,
+        ):
             mock_or.return_value = (None, "transient")
             mock_local.return_value = "Local OK"
 
-            # First call: triggers failure and breaker
-            text1, fb1 = await client.query_model(sys_prompt="S", ctx_txt="C", q="Q")
-            assert fb1 is True
+            text, used_fb = await client.query_model(sys_prompt="S", ctx_txt="C", q="Q")
+
+            assert text == "Local OK"
+            assert used_fb is True
             assert await client.is_remote_blocked() is True
 
-            # Second call: breaker active, remote not called
             mock_or.reset_mock()
-            text2, fb2 = await client.query_model(sys_prompt="S", ctx_txt="C", q="Q")
-            assert fb2 is True
-            mock_or.assert_not_called()  # breaker prevented call
+            mock_local.reset_mock()
+
+            text2, used_fb2 = await client.query_model(sys_prompt="S", ctx_txt="C", q="Q")
+
+            assert text2 == "Local OK"
+            assert used_fb2 is True
+            mock_or.assert_not_awaited()
+            mock_local.assert_awaited()
 
         await client.close()
 
+    @pytest.mark.asyncio
     async def test_local_llm_timeout_handling(self, config):
-        """call_local_llm handles timeouts gracefully."""
         client = LLMClient(config)
 
-        with patch.object(client._session_holder, 'get', new_callable=AsyncMock) as mock_get:
-            mock_session = AsyncMock()
-            # Mock the context manager properly
-            mock_response = AsyncMock()
-            mock_response.__aenter__ = AsyncMock(side_effect=asyncio.TimeoutError())
-            mock_response.__aexit__ = AsyncMock(return_value=None)
-            mock_session.post.return_value = mock_response
+        class _TimeoutCM:
+            async def __aenter__(self):
+                raise asyncio.TimeoutError()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        with patch.object(client._session_holder, "get", new_callable=AsyncMock) as mock_get:
+            mock_session = Mock()
+            mock_session.post = Mock(return_value=_TimeoutCM())
             mock_get.return_value = mock_session
 
             result = await client.call_local_llm("test prompt", timeout_sec=1)
-            assert "timeout" in result.lower() or "error" in result.lower()
+            assert "timeout" in result.lower()
 
         await client.close()
 
-    @pytest.mark.skip(reason="Cross-thread sync check is implementation-dependent")
-    async def test_is_remote_blocked_sync(self, config):
-        """Sync breaker check works from non-async context."""
-        client = LLMClient(config)
-        loop = asyncio.get_running_loop()
-        client.attach_loop(loop)
+    def test_is_remote_blocked_sync_cross_thread(self, config):
+        """
+        Deterministic cross-thread test:
+        - Run an event loop in a background thread
+        - Create client inside that loop thread
+        - Call is_remote_blocked_sync() from the main thread
+        """
+        q: queue.Queue[tuple[LLMClient, asyncio.AbstractEventLoop]] = queue.Queue()
 
-        # Initially closed (not blocked)
-        result = client.is_remote_blocked_sync()
-        # Should return False when breaker is closed
-        assert result in (False, True)  # Either state is valid initially
+        def _loop_thread() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-        # Open breaker
-        await client._breaker.on_failure()
-        # Give time for state change
-        await asyncio.sleep(0.1)
-        result2 = client.is_remote_blocked_sync()
-        # After failure, should be blocked
-        assert result2 is True
+            client = LLMClient(config)
+            client.attach_loop(loop)
 
-        await client.close()
+            q.put((client, loop))
+            loop.run_forever()
+
+            loop.close()
+
+        t = threading.Thread(target=_loop_thread, daemon=True)
+        t.start()
+
+        client, loop = q.get(timeout=2.0)
+
+        try:
+            assert client.is_remote_blocked_sync() is False
+
+            asyncio.run_coroutine_threadsafe(client._breaker.on_failure(), loop).result(timeout=2.0)
+            assert client.is_remote_blocked_sync() is True
+
+            asyncio.run_coroutine_threadsafe(client.close(), loop).result(timeout=2.0)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            t.join(timeout=2.0)

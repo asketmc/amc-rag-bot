@@ -7,23 +7,24 @@ Tests for RAG filtering and context building (P1 Critical Feature)
 - Cache functionality
 - Lemma matching
 """
-import pytest
 import asyncio
 import sys
 from pathlib import Path
-from typing import FrozenSet
+from unittest.mock import MagicMock
+
+import pytest
 
 # Add src to path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src" / "asketmc_bot"))
 
 # Mock llama_index before importing rag_filter
-from unittest.mock import MagicMock
 llama_pkg = MagicMock()
 llama_core = MagicMock()
 
+
 class MockNode:
-    def __init__(self, text="", metadata=None):
+    def __init__(self, text: str = "", metadata=None):
         self.text = text
         self.metadata = metadata or {}
         self.id = f"node_{id(self)}"
@@ -31,32 +32,38 @@ class MockNode:
     def get_content(self, metadata_mode=None):
         return self.text
 
+
 class MockNodeWithScore:
-    def __init__(self, text="", score=0.5, lemmas=None):
+    def __init__(self, text: str = "", score: float = 0.5, lemmas=None):
         self.node = MockNode(text, {"lemmas": lemmas or []})
         self.score = score
 
+
 llama_core.schema = MagicMock()
 llama_core.schema.NodeWithScore = MockNodeWithScore
-sys.modules['llama_index'] = llama_pkg
-sys.modules['llama_index.core'] = llama_core
-sys.modules['llama_index.core.schema'] = llama_core.schema
+sys.modules["llama_index"] = llama_pkg
+sys.modules["llama_index.core"] = llama_core
+sys.modules["llama_index.core.schema"] = llama_core.schema
 
 # Now import after mocking
-from rag_filter import get_filtered_nodes, build_context, purge_filter_cache, _cache_key
-
-
-pytestmark = pytest.mark.asyncio
+from asketmc_bot.rag_filter import (  # noqa: E402
+    _cache_key,
+    build_context,
+    get_filtered_nodes,
+    purge_filter_cache,
+)
 
 
 class TestNodeFiltering:
     """Test node filtering with lemma matching and score thresholds."""
 
+    @pytest.mark.asyncio
     async def test_empty_nodes_returns_empty(self):
         """Empty input returns empty list."""
         result = await get_filtered_nodes([], frozenset())
         assert result == []
 
+    @pytest.mark.asyncio
     async def test_filters_by_score_threshold(self):
         """Nodes below score threshold are filtered out."""
         nodes = [
@@ -66,10 +73,10 @@ class TestNodeFiltering:
         qlem = frozenset(["test"])
 
         result = await get_filtered_nodes(nodes, qlem)
-        # High score node should be included
         assert len(result) >= 1
         assert any(n.node.text == "high score" for n in result)
 
+    @pytest.mark.asyncio
     async def test_filters_by_lemma_intersection(self):
         """Nodes with lemma overlap are prioritized."""
         nodes = [
@@ -79,22 +86,19 @@ class TestNodeFiltering:
         qlem = frozenset(["apple"])
 
         result = await get_filtered_nodes(nodes, qlem)
-        # Node with matching lemma should be preferred
         if result:
             assert any("apple" in n.node.metadata.get("lemmas", []) for n in result)
 
+    @pytest.mark.asyncio
     async def test_respects_top_k_limit(self):
         """Returns at most TOP_K nodes."""
-        nodes = [
-            MockNodeWithScore(text=f"doc{i}", score=0.9, lemmas=["test"])
-            for i in range(100)
-        ]
+        nodes = [MockNodeWithScore(text=f"doc{i}", score=0.9, lemmas=["test"]) for i in range(100)]
         qlem = frozenset(["test"])
 
         result = await get_filtered_nodes(nodes, qlem)
-        # Should not exceed TOP_K (default 8 in config, but may vary)
         assert len(result) <= 30  # reasonable upper bound
 
+    @pytest.mark.asyncio
     async def test_cache_hit_returns_cached_result(self):
         """Second call with same inputs returns cached result."""
         purge_filter_cache()
@@ -105,7 +109,6 @@ class TestNodeFiltering:
         result1 = await get_filtered_nodes(nodes, qlem)
         result2 = await get_filtered_nodes(nodes, qlem)
 
-        # Results should be consistent (from cache)
         assert len(result1) == len(result2)
 
 
@@ -119,10 +122,7 @@ class TestContextBuilding:
 
     def test_respects_char_limit(self):
         """Context doesn't exceed character limit."""
-        nodes = [
-            MockNodeWithScore(text="a" * 1000, score=0.9, lemmas=["test"])
-            for _ in range(10)
-        ]
+        nodes = [MockNodeWithScore(text="a" * 1000, score=0.9, lemmas=["test"]) for _ in range(10)]
         qlem = frozenset(["test"])
 
         result = build_context(nodes, qlem, char_limit=500)
@@ -138,7 +138,6 @@ class TestContextBuilding:
         qlem = frozenset(["test"])
 
         result = build_context(nodes, qlem, char_limit=5000)
-        # Content should appear only once
         assert result.count(identical_text) == 1
 
     def test_prioritizes_high_scoring_nodes(self):
@@ -150,7 +149,6 @@ class TestContextBuilding:
         qlem = frozenset(["test"])
 
         result = build_context(nodes, qlem, char_limit=5000)
-        # High score should appear before low score
         if "high" in result and "low" in result:
             assert result.index("high") < result.index("low")
 
@@ -163,7 +161,6 @@ class TestContextBuilding:
         qlem = frozenset(["test"])
 
         result = build_context(nodes, qlem, char_limit=5000)
-        # Should contain separator between chunks
         if "chunk1" in result and "chunk2" in result:
             assert "---" in result
 
@@ -177,7 +174,6 @@ class TestContextBuilding:
 
         result = build_context(nodes, qlem, char_limit=5000)
         assert "valid" in result
-        # Empty node should not add separators
         assert result.strip() != "---"
 
 
@@ -189,13 +185,8 @@ class TestCacheFunctionality:
         nodes = [MockNodeWithScore(text="test", score=0.8, lemmas=["test"])]
         qlem = frozenset(["test"])
 
-        # Populate cache
         asyncio.run(get_filtered_nodes(nodes, qlem))
-
-        # Purge
         purge_filter_cache()
-
-        # Cache should be empty (can't directly test, but shouldn't error)
         asyncio.run(get_filtered_nodes(nodes, qlem))
 
     def test_cache_key_uniqueness(self):

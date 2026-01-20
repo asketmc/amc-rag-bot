@@ -1,20 +1,21 @@
 #!/usr/bin/env python3.10
-"""Production-grade CrossEncoder reranker (async-safe, CPU/GPU).
+"""CrossEncoder reranker for NodeWithScore candidates.
 
 Public API:
     * await init_reranker(force: bool = False) -> None
     * await shutdown_reranker() -> None
     * await rerank(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]
 
-Features:
-    - Config-driven with safe defaults (taken from `config`).
-    - Async/thread-safe initialization guarded by an asyncio.Lock.
-    - Bounded ThreadPoolExecutor for CPU-bound inference.
-    - CPU/GPU selection with CUDA availability checks.
-    - Inference timeout and retries.
-    - Strict input validation (regex + max length).
-    - No eval/exec/shell, no unsafe deserialization.
-    - Structured logging; DEBUG is verbose in development.
+Behavior:
+    - Configuration is read from `config` with defaults.
+    - Lazy initialization guarded by an asyncio.Lock.
+    - Inference is executed in a ThreadPoolExecutor via run_in_executor.
+    - A timeout is applied to waiting for the inference result; the underlying thread work cannot be forcibly stopped.
+    - Optional retries on timeout/exception.
+    - Query validation: strip, non-empty, max length, allowlist regex.
+
+Logging:
+    - Uses stdlib logging under logger name "asketmc.rerank".
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import torch
 from llama_index.core.schema import NodeWithScore
 from sentence_transformers import CrossEncoder
 
-import config as cfg
+from asketmc_bot import config as cfg
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -67,6 +68,9 @@ _EXECUTOR_WORKERS = int(getattr(cfg, "EXECUTOR_WORKERS", 4))
 _PREDICT_TIMEOUT_SEC = float(getattr(cfg, "PREDICT_TIMEOUT_SEC", 120.0))
 _PREDICT_RETRIES = int(getattr(cfg, "PREDICT_RETRIES", 1))  # 0 means no retries
 
+# Best-effort shutdown wait for an in-flight inference.
+_SHUTDOWN_WAIT_SEC = float(getattr(cfg, "RERANK_SHUTDOWN_WAIT_SEC", 10.0))
+
 # -----------------------------------------------------------------------------
 # Globals (lazy-initialized; protected by _INIT_LOCK)
 # -----------------------------------------------------------------------------
@@ -74,6 +78,9 @@ _PREDICT_RETRIES = int(getattr(cfg, "PREDICT_RETRIES", 1))  # 0 means no retries
 _RERANKER: Optional[CrossEncoder] = None
 _EXECUTOR: Optional[ThreadPoolExecutor] = None
 _INIT_LOCK = asyncio.Lock()
+
+# Tracks current inference to avoid overlapping inference and to coordinate shutdown.
+_INFLIGHT: Optional[asyncio.Future[List[float]]] = None
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -121,7 +128,7 @@ def _node_text(n: NodeWithScore) -> str:
 
 
 def _filter_pairs(
-    query: str, nodes: List[NodeWithScore]
+        query: str, nodes: List[NodeWithScore]
 ) -> Tuple[List[List[str]], List[NodeWithScore]]:
     """Return (query, doc) pairs and corresponding nodes, skipping empty docs."""
     cand_nodes: List[NodeWithScore] = nodes[:_RERANK_INPUT_K]
@@ -148,22 +155,36 @@ def _filter_pairs(
     return pairs, filtered_nodes
 
 
+def _clear_inflight_cb(_fut: asyncio.Future) -> None:
+    global _INFLIGHT
+    _INFLIGHT = None
+
+
 # -----------------------------------------------------------------------------
 # Lifecycle
 # -----------------------------------------------------------------------------
 
 async def init_reranker(force: bool = False) -> None:
     """Initialize CrossEncoder and thread pool safely; re-init on force=True."""
-    global _RERANKER, _EXECUTOR
+    global _RERANKER, _EXECUTOR, _INFLIGHT
+
     async with _INIT_LOCK:
+        if _INFLIGHT is not None and not _INFLIGHT.done():
+            _LOG.info("[init_reranker] inference in-flight; skip init")
+            return
+
         if _RERANKER is not None and _EXECUTOR is not None and not force:
             _LOG.info("[init_reranker] already initialized; skip (force=False)")
             return
 
         if _EXECUTOR is not None:
             _LOG.info("[init_reranker] shutting down previous executor")
-            _EXECUTOR.shutdown(wait=True)
+            try:
+                _EXECUTOR.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                _EXECUTOR.shutdown(wait=True)
             _EXECUTOR = None
+
         if _RERANKER is not None:
             try:
                 if torch.cuda.is_available():
@@ -177,7 +198,7 @@ async def init_reranker(force: bool = False) -> None:
                         "[init_reranker] CUDA cache cleared: %.2f -> %.2f MB",
                         mem_before / (1024 ** 2),
                         mem_after / (1024 ** 2),
-                    )
+                        )
             except Exception as exc:  # pragma: no cover
                 _LOG.warning(
                     "[init_reranker] error during previous model cleanup: %s", exc
@@ -185,8 +206,7 @@ async def init_reranker(force: bool = False) -> None:
 
         device = _choose_device()
         _LOG.info(
-            "[init_reranker] loading CrossEncoder model=%s device=%s max_length=%d "
-            "workers=%d",
+            "[init_reranker] loading CrossEncoder model=%s device=%s max_length=%d workers=%d",
             _RERANKER_MODEL_NAME,
             device,
             _MAX_LEN,
@@ -208,13 +228,40 @@ async def init_reranker(force: bool = False) -> None:
 
 async def shutdown_reranker() -> None:
     """Release thread pool and GPU memory (if any)."""
-    global _RERANKER, _EXECUTOR
+    global _RERANKER, _EXECUTOR, _INFLIGHT
+
     async with _INIT_LOCK:
         _LOG.info("[shutdown_reranker] called")
+
+        # Best-effort: wait a bit for in-flight inference to finish.
+        inflight = _INFLIGHT
+        if inflight is not None and not inflight.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(inflight), timeout=_SHUTDOWN_WAIT_SEC)
+            except asyncio.TimeoutError:
+                _LOG.warning(
+                    "[shutdown_reranker] in-flight inference did not finish within %.1fs; "
+                    "skipping model/CUDA cleanup",
+                    _SHUTDOWN_WAIT_SEC,
+                )
+                # Do not clear CUDA cache or delete model while an inference thread may still be using it.
+                # Best-effort executor shutdown without waiting; prevents new tasks from being queued.
+                if _EXECUTOR is not None:
+                    try:
+                        _EXECUTOR.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        _EXECUTOR.shutdown(wait=False)
+                    _EXECUTOR = None
+                return
+
         try:
             if _EXECUTOR is not None:
-                _EXECUTOR.shutdown(wait=True)
+                try:
+                    _EXECUTOR.shutdown(wait=True, cancel_futures=True)
+                except TypeError:
+                    _EXECUTOR.shutdown(wait=True)
                 _EXECUTOR = None
+
             if _RERANKER is not None:
                 try:
                     if torch.cuda.is_available():
@@ -228,12 +275,13 @@ async def shutdown_reranker() -> None:
                             "[shutdown_reranker] CUDA cache cleared: %.2f -> %.2f MB",
                             mem_before / (1024 ** 2),
                             mem_after / (1024 ** 2),
-                        )
+                            )
                 except Exception as exc:  # pragma: no cover
                     _LOG.warning(
                         "[shutdown_reranker] error during model cleanup: %s", exc
                     )
         finally:
+            _INFLIGHT = None
             _LOG.info("[shutdown_reranker] resources released")
 
 
@@ -242,33 +290,14 @@ async def shutdown_reranker() -> None:
 # -----------------------------------------------------------------------------
 
 async def rerank(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]:
-    """Score candidate nodes with a CrossEncoder and return top-K results.
-
-    Args:
-        query: User query string.
-        nodes: Candidate nodes to rerank.
-
-    Returns:
-        Top `cfg.RERANK_OUTPUT_K` nodes sorted by descending score.
-        Returns an empty list on inference failure.
-
-    Raises:
-        ValueError: If the query violates input policy.
-    """
-    global _RERANKER, _EXECUTOR
+    """Score candidate nodes with a CrossEncoder and return top-K results."""
+    global _RERANKER, _EXECUTOR, _INFLIGHT
 
     query = _sanitize_input(query, max_len=_QUERY_MAX_CHARS)
 
     if not nodes:
         _LOG.debug("[rerank] empty input nodes -> []")
         return []
-
-    if _RERANKER is None or _EXECUTOR is None:
-        _LOG.info("[rerank] reranker not initialized; attempting init")
-        await init_reranker(force=False)
-        if _RERANKER is None or _EXECUTOR is None:
-            _LOG.error("[rerank] init failed -> []")
-            return []
 
     pairs, valid_nodes = _filter_pairs(query, nodes)
     if not pairs:
@@ -277,42 +306,64 @@ async def rerank(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]:
 
     loop = asyncio.get_running_loop()
 
-    def _predict_once() -> List[float]:
-        t0 = time.perf_counter()
-        scores = _RERANKER.predict(
-            pairs,
-            batch_size=_BATCH_SIZE,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
-        dt = time.perf_counter() - t0
-        _LOG.info(
-            "[_predict_once] model=%s items=%d batch=%d took=%.3fs",
-            _RERANKER_MODEL_NAME,
-            len(pairs),
-            _BATCH_SIZE,
-            dt,
-        )
-        try:
-            return scores.tolist()  # type: ignore[attr-defined]
-        except Exception:
-            return list(scores)
-
     attempt = 0
     last_err: Optional[Exception] = None
+
     while attempt <= _PREDICT_RETRIES:
         attempt += 1
+
+        async with _INIT_LOCK:
+            # If an inference is already running, do not overlap work on the same model/executor.
+            if _INFLIGHT is not None and not _INFLIGHT.done():
+                _LOG.info("[rerank] inference already in-flight -> []")
+                return []
+
+            if _RERANKER is None or _EXECUTOR is None:
+                _LOG.info("[rerank] reranker not initialized; attempting init")
+                await init_reranker(force=False)
+                if _RERANKER is None or _EXECUTOR is None:
+                    _LOG.error("[rerank] init failed -> []")
+                    return []
+
+            model = _RERANKER
+            executor = _EXECUTOR
+
+            def _predict_once() -> List[float]:
+                t0 = time.perf_counter()
+                scores = model.predict(
+                    pairs,
+                    batch_size=_BATCH_SIZE,
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                )
+                dt = time.perf_counter() - t0
+                _LOG.info(
+                    "[_predict_once] model=%s items=%d batch=%d took=%.3fs",
+                    _RERANKER_MODEL_NAME,
+                    len(pairs),
+                    _BATCH_SIZE,
+                    dt,
+                )
+                try:
+                    return scores.tolist()  # type: ignore[attr-defined]
+                except Exception:
+                    return list(scores)
+
+            # Schedule under lock so shutdown can't invalidate executor between snapshot and submit.
+            fut: asyncio.Future[List[float]] = loop.run_in_executor(executor, _predict_once)
+            _INFLIGHT = fut
+            fut.add_done_callback(_clear_inflight_cb)
+
         try:
-            fut = loop.run_in_executor(_EXECUTOR, _predict_once)
-            scores: List[float] = await asyncio.wait_for(
-                fut, timeout=_PREDICT_TIMEOUT_SEC
-            )
+            scores = await asyncio.wait_for(asyncio.shield(fut), timeout=_PREDICT_TIMEOUT_SEC)
+
             ranked: List[Tuple[NodeWithScore, float]] = sorted(
                 zip(valid_nodes, scores), key=lambda x: x[1], reverse=True
             )
             if not ranked:
                 _LOG.warning("[rerank] empty result after scoring -> []")
                 return []
+
             top_k = _RERANK_OUTPUT_K
             out = [n for n, _ in ranked[:top_k]]
             _LOG.debug(
@@ -321,14 +372,18 @@ async def rerank(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]:
                 [getattr(getattr(n, "node", n), "id", "n/a") for n in out],
             )
             return out
+
         except asyncio.TimeoutError as exc:
             last_err = exc
             _LOG.warning(
-                "[rerank] inference timeout after %.1fs (attempt %d/%d)",
+                "[rerank] inference wait timeout after %.1fs (attempt %d/%d) -> []",
                 _PREDICT_TIMEOUT_SEC,
                 attempt,
                 _PREDICT_RETRIES + 1,
-            )
+                )
+            # Underlying thread work may still be running; block overlapping inference via _INFLIGHT guard.
+            return []
+
         except Exception as exc:
             last_err = exc
             _LOG.exception(
@@ -336,7 +391,8 @@ async def rerank(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]:
                 attempt,
                 _PREDICT_RETRIES + 1,
                 exc,
-            )
+                )
+
         if attempt <= _PREDICT_RETRIES:
             await asyncio.sleep(min(0.25 * attempt, 1.0))
 
@@ -344,5 +400,5 @@ async def rerank(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]:
         "[rerank] giving up after %d attempts -> [] (%s)",
         _PREDICT_RETRIES + 1,
         last_err,
-    )
+        )
     return []
