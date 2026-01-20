@@ -1,0 +1,45 @@
+name: CodeQL
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (python)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for recent commits
+        id: recent
+        env:
+          LOOKBACK_DAYS: "14"
+        run: |
+          if git log -1 --since="${LOOKBACK_DAYS} days ago" --pretty=%H | grep -q .; then
+            echo "has_recent=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_recent=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Initialize CodeQL
+        if: github.event_name == 'workflow_dispatch' || steps.recent.outputs.has_recent == 'true'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: python
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        if: github.event_name == 'workflow_dispatch' || steps.recent.outputs.has_recent == 'true'
+        uses: github/codeql-action/analyze@v4

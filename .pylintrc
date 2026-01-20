@@ -1,0 +1,51 @@
+[MASTER]
+py-version=3.10
+jobs=0
+persistent=yes
+# Ignore venv, caches, IDE metadata
+ignore=.venv,venv,build,dist,.git,__pycache__,.mypy_cache,.pytest_cache,.ruff_cache,.idea
+ignore-patterns=^\.eggs,.*\.pyi$
+
+# src layout: make "import asketmc_bot" resolvable for pylint without extra PYTHONPATH
+init-hook='import sys; sys.path.append("src")'
+
+[MESSAGES CONTROL]
+disable=
+    C0114,  # docstrings: start without enforcing docs
+    C0115,  # docstrings: start without enforcing docs
+    C0116,  # docstrings: start without enforcing docs
+    C0103,  # naming: avoid early churn on identifiers
+    R0903,  # DTO/fixtures: single-method classes are OK
+    C0415,  # lazy imports: allow optional/heavy deps
+    W0511,  # TODO/FIXME: allow during refactor
+    W0703,  # broad Exception: common in boundary code, tighten later per-module
+    R0911,  # complexity: allow high return count for now
+    R0912,  # complexity: allow branches for now
+    R0914,  # complexity: allow locals for now
+    R0915,  # complexity: allow long functions for now
+    R0913,  # signatures: allow DI-style many args for now
+    R0902,  # stateful classes: allow more attributes for now
+    W0603,  # globals: allow cache/lazy-init patterns, remove later
+    W0602   # globals: avoid false positives on "global x" without assignment
+
+[FORMAT]
+# Keep consistent line length; enables gradual cleanup of long lines
+max-line-length=100
+
+[DESIGN]
+# Soft guardrails: warn when thresholds are exceeded, but thresholds are relaxed
+max-args=10
+max-locals=25
+max-branches=18
+max-statements=70
+max-returns=10
+
+[TYPECHECK]
+# Reduce noise from dynamic third-party libs with generated attributes
+ignored-modules=stanza,spacy,langdetect,torch,discord,llama_index,sentence_transformers,langsmith
+generated-members=stanza.*,spacy.*,torch.*,discord.*,llama_index.*,sentence_transformers.*,langsmith.*
+
+[REPORTS]
+score=yes
+reports=no
+output-format=colorized
