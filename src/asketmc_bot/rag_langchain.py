@@ -8,6 +8,16 @@ Design goals:
 - PEP 8/257 compliant, typed, idempotent nodes.
 - Structured logging; deterministic behavior; clear guards and fallbacks.
 - Safe import behavior when optional deps (langgraph/langsmith) are not installed.
+
+Fixes:
+- Make lemma-based filtering non-destructive:
+  - If lemmas are empty -> skip filter and pass-through candidates.
+  - If filter returns empty -> fallback to pass-through candidates.
+  - If filter errors -> fallback to pass-through candidates.
+- Make context building resilient:
+  - If filtered_nodes empty -> fallback to reranked/retrieved.
+  - If build_context returns empty with lemmas -> retry with empty-lemmas.
+- Add node-level debug counters (retrieved/reranked/filtered/context length).
 """
 
 from __future__ import annotations
@@ -19,6 +29,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Set, TypedDict, cast
 from asketmc_bot import config as cfg
 
 log = logging.getLogger("asketmc.rag.langgraph")
+log.setLevel(logging.DEBUG if getattr(cfg, "DEBUG", False) else logging.INFO)
 
 # --- Optional dependency: langgraph -----------------------------------------
 # Keep module importable even when langgraph isn't installed (dev/CI environments).
@@ -47,7 +58,6 @@ class RagDeps(TypedDict):
     Dependencies required by the RAG pipeline.
     Provide concrete callables and objects to avoid circular imports.
     """
-
     extract_lemmas: Callable[[str], Set[str]]
     retriever: Any  # must expose `aretrieve(q: str) -> Awaitable[List[Any]]`
     rerank: Callable[[str, List[Any]], Awaitable[List[Any]]]
@@ -91,8 +101,14 @@ def _require_non_empty_question(state: RagState, *, node_name: str) -> str:
 def _lemmas_node(deps: RagDeps) -> Callable[[RagState], Dict[str, Any]]:
     def _impl(state: RagState) -> Dict[str, Any]:
         question = _require_non_empty_question(state, node_name="lemmas")
-        lemmas = deps["extract_lemmas"](question)
-        return {"lemmas": set(lemmas) if lemmas else set()}
+        try:
+            lemmas = deps["extract_lemmas"](question)
+        except Exception as exc:
+            log.warning("[lemmas] extract_lemmas failed: %s", exc)
+            lemmas = set()
+        out = set(lemmas) if lemmas else set()
+        log.debug("[lemmas] size=%d", len(out))
+        return {"lemmas": out}
 
     return _impl
 
@@ -101,7 +117,9 @@ def _retrieve_node(deps: RagDeps) -> Callable[[RagState], Awaitable[Dict[str, An
     async def _impl(state: RagState) -> Dict[str, Any]:
         question = _require_non_empty_question(state, node_name="retrieve")
         retrieved = await deps["retriever"].aretrieve(question)
-        return {"retrieved_nodes": list(retrieved) if retrieved else []}
+        out = list(retrieved) if retrieved else []
+        log.debug("[retrieve] nodes=%d", len(out))
+        return {"retrieved_nodes": out}
 
     return _impl
 
@@ -111,36 +129,97 @@ def _rerank_node(deps: RagDeps) -> Callable[[RagState], Awaitable[Dict[str, Any]
         question = _require_non_empty_question(state, node_name="rerank")
         retrieved = state.get("retrieved_nodes") or []
         if not retrieved:
+            log.debug("[rerank] nodes=0 (skip)")
             return {"reranked_nodes": []}
 
-        ranked = await deps["rerank"](question, retrieved)
-        # Keep stable fallback to original ordering if reranker returns empty/None.
-        return {"reranked_nodes": list(ranked) if ranked else list(retrieved)}
+        try:
+            ranked = await deps["rerank"](question, retrieved)
+        except Exception as exc:
+            log.warning("[rerank] failed: %s (fallback to retrieved order)", exc)
+            ranked = list(retrieved)
+
+        out = list(ranked) if ranked else list(retrieved)
+        log.debug("[rerank] nodes=%d", len(out))
+        return {"reranked_nodes": out}
 
     return _impl
 
 
 def _filter_node(deps: RagDeps) -> Callable[[RagState], Awaitable[Dict[str, Any]]]:
     async def _impl(state: RagState) -> Dict[str, Any]:
-        lemmas = state.get("lemmas") or set()
+        lemmas = cast(Set[str], state.get("lemmas") or set())
         candidates = state.get("reranked_nodes") or state.get("retrieved_nodes") or []
-        filtered = await deps["get_filtered_nodes"](candidates, cast(Set[str], lemmas))
-        return {"filtered_nodes": list(filtered) if filtered else []}
+        if not candidates:
+            log.debug("[filter] candidates=0 (skip)")
+            return {"filtered_nodes": []}
+
+        # Non-destructive behavior:
+        # - empty lemmas => skip filter
+        if not lemmas:
+            log.debug("[filter] lemmas=0 -> pass-through candidates=%d", len(candidates))
+            return {"filtered_nodes": list(candidates)}
+
+        try:
+            filtered = await deps["get_filtered_nodes"](list(candidates), cast(Set[str], lemmas))
+        except Exception as exc:
+            log.warning("[filter] get_filtered_nodes failed: %s (pass-through)", exc)
+            return {"filtered_nodes": list(candidates)}
+
+        if not filtered:
+            log.debug("[filter] filtered=0 -> pass-through candidates=%d", len(candidates))
+            return {"filtered_nodes": list(candidates)}
+
+        out = list(filtered)
+        log.debug("[filter] nodes=%d", len(out))
+        return {"filtered_nodes": out}
 
     return _impl
 
 
 def _context_node(
-        deps: RagDeps,
-        *,
-        use_remote_ctx: bool,
+    deps: RagDeps,
+    *,
+    use_remote_ctx: bool,
 ) -> Callable[[RagState], Dict[str, Any]]:
     def _impl(state: RagState) -> Dict[str, Any]:
-        lemmas = state.get("lemmas") or set()
-        nodes = state.get("filtered_nodes") or []
+        lemmas = cast(Set[str], state.get("lemmas") or set())
+
+        # Prefer filtered, but never allow empty to kill context completely.
+        nodes = (
+            state.get("filtered_nodes")
+            or state.get("reranked_nodes")
+            or state.get("retrieved_nodes")
+            or []
+        )
+
         limit = deps["ctx_len_remote"] if use_remote_ctx else deps["ctx_len_local"]
-        ctx_txt = deps["build_context"](nodes, cast(Set[str], lemmas), int(limit))
-        return {"context": ctx_txt}
+
+        ctx_txt = ""
+        if nodes:
+            try:
+                ctx_txt = deps["build_context"](list(nodes), cast(Set[str], lemmas), int(limit))
+            except Exception as exc:
+                log.warning("[context] build_context failed: %s", exc)
+                ctx_txt = ""
+
+            # If context came back empty, retry without lemma constraints (common failure mode).
+            if not ctx_txt and lemmas:
+                try:
+                    ctx_txt = deps["build_context"](list(nodes), set(), int(limit))
+                    if ctx_txt:
+                        log.debug("[context] recovered by retry with lemmas=0")
+                except Exception as exc:
+                    log.warning("[context] retry build_context(lemmas=0) failed: %s", exc)
+
+        ctx_len = len((ctx_txt or "").strip())
+        log.debug(
+            "[context] nodes=%d limit=%d ctx_len=%d remote=%s",
+            len(nodes),
+            int(limit),
+            ctx_len,
+            bool(use_remote_ctx),
+        )
+        return {"context": ctx_txt or ""}
 
     return _impl
 
@@ -153,7 +232,8 @@ def _llm_node(deps: RagDeps) -> Callable[[RagState], Awaitable[Dict[str, Any]]]:
 
         timeout_total = int(getattr(cfg, "HTTP_TIMEOUT_TOTAL", 240))
 
-        # Prefer calling with keyword args matching LLMClient.query_model signature.
+        log.debug("[llm] q_len=%d ctx_len=%d timeout_sec=%d", len(question), len(context), timeout_total)
+
         try:
             text, _used_fallback = await deps["query_model"](
                 sys_prompt=sys_prompt,
@@ -162,19 +242,19 @@ def _llm_node(deps: RagDeps) -> Callable[[RagState], Awaitable[Dict[str, Any]]]:
                 timeout_sec=timeout_total,
             )
         except TypeError:
-            # Fallback for simpler callable signatures
             text, _used_fallback = await deps["query_model"](sys_prompt, context, question, timeout_total)
 
         answer = (text or "").strip() or "No answer."
+        log.debug("[llm] answer_len=%d", len(answer))
         return {"answer": answer}
 
     return _impl
 
 
 def build_rag_graph(
-        deps: RagDeps,
-        *,
-        use_remote_ctx: bool = False,
+    deps: RagDeps,
+    *,
+    use_remote_ctx: bool = False,
 ) -> Any:
     """
     Build a LangGraph StateGraph for the RAG pipeline (no side effects, not compiled).
@@ -206,11 +286,11 @@ def build_rag_graph(
 
 
 async def run_rag_pipeline(
-        question: str,
-        deps: RagDeps,
-        *,
-        use_remote_ctx: bool = False,
-        enable_tracing: bool = False,
+    question: str,
+    deps: RagDeps,
+    *,
+    use_remote_ctx: bool = False,
+    enable_tracing: bool = False,
 ) -> str:
     """
     Convenience runner to build, compile, and invoke the graph once.

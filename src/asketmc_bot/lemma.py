@@ -15,7 +15,7 @@ Exported API:
 
 Notes:
 - No model downloads or heavy initialization at import time.
-- Model init is lazy and failure-tolerant.
+- Model init is lazy. Optional stanza resources auto-download can happen on first use.
 - Cache files are stored under cfg.CACHE_PATH.
 """
 
@@ -32,7 +32,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional
+from typing import Dict, FrozenSet, List, Optional, Tuple
 
 # Third-party
 import spacy
@@ -67,90 +67,54 @@ LEMMA_POOL = ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 8))
 # ─────────────────────────────────────────────────────────
 _STANZA_NLP_RU: Optional[stanza.Pipeline] = None
 _SPACY_EN = None
-_MODELS_INIT_TRIED = False
-_MODELS_AVAILABLE = False
 
-# Degraded-mode reporting / retry gate
-_DEGRADED_WARNED = False
+# Tracks readiness separately (important for cache invalidation).
+_SPACY_READY = False
+_STANZA_READY = False
+
+_MODELS_INIT_TRIED = False
 _LAST_INIT_ATTEMPT_TS = 0.0
 _INIT_RETRY_COOLDOWN_SEC = float(getattr(cfg, "LEMMA_INIT_RETRY_COOLDOWN_SEC", 300.0))
 
+# Degraded-mode reporting (one-time)
+_DEGRADED_WARNED = False
 
-def _try_init_models(*, force_retry: bool = False) -> bool:
-    """
-    Lazily initialize stanza + spaCy models.
+# Cache epoch: changes whenever model availability changes.
+# Used to prevent "empty lemma" results from being cached forever.
+_MODELS_EPOCH = 0
 
-    No downloads are triggered here.
-    If models are missing/unavailable, returns False and lemmatization degrades to empty sets.
+# Stanza resources location + auto-download switch (lazy, on first use).
+_STANZA_DIR: Path = Path(
+    getattr(cfg, "STANZA_RESOURCES_DIR", cfg.CACHE_PATH / "stanza")
+).resolve()
+_STANZA_AUTO_DOWNLOAD: bool = bool(getattr(cfg, "STANZA_AUTO_DOWNLOAD", True))
 
-    Thread-safety:
-    - Single initializer under _MODELS_INIT_LOCK.
 
-    Retry behavior:
-    - If init previously failed, allow a throttled retry (cooldown) or explicit force_retry.
-    """
-    global _STANZA_NLP_RU, _SPACY_EN, _MODELS_INIT_TRIED, _MODELS_AVAILABLE
-    global _LAST_INIT_ATTEMPT_TS
+def _invalidate_all_lemma_caches(reason: str) -> None:
+    """Clear all lemma-related caches and persisted cache files."""
+    global _MODELS_EPOCH
+    _MODELS_EPOCH += 1
 
-    now = time.time()
+    try:
+        _extract_lemmas_cached.cache_clear()
+    except Exception:
+        pass
 
-    if _MODELS_INIT_TRIED and _MODELS_AVAILABLE:
-        return True
+    CHUNK_LEMMA_CACHE.clear()
+    FILE_LEMMAS.clear()
 
-    if _MODELS_INIT_TRIED and not _MODELS_AVAILABLE and not force_retry:
-        if (now - _LAST_INIT_ATTEMPT_TS) < _INIT_RETRY_COOLDOWN_SEC:
-            return False
-
-    with _MODELS_INIT_LOCK:
-        now = time.time()
-
-        if _MODELS_INIT_TRIED and _MODELS_AVAILABLE:
-            return True
-
-        if _MODELS_INIT_TRIED and not _MODELS_AVAILABLE and not force_retry:
-            if (now - _LAST_INIT_ATTEMPT_TS) < _INIT_RETRY_COOLDOWN_SEC:
-                return False
-
-        _LAST_INIT_ATTEMPT_TS = now
-
-        spacy_en = None
-        stanza_ru = None
-
-        # spaCy EN
+    for fp in (LEMMA_INDEX_FILE, CHUNK_LEMMA_CACHE_FILE):
         try:
-            spacy_en = spacy.load("en_core_web_sm")
-            log.info("[LEMMATIZER] spaCy en_core_web_sm ready")
-        except Exception as e:
-            spacy_en = None
-            log.warning("[LEMMATIZER] spaCy model not available: %s", e)
+            if fp.exists():
+                fp.unlink()
+        except Exception:
+            pass
 
-        # stanza RU (expects resources already installed in stanza's default dir)
-        try:
-            stanza_ru = stanza.Pipeline(
-                lang="ru",
-                processors="tokenize,pos,lemma",
-                use_gpu=False,
-                verbose=False,
-            )
-            log.info("[LEMMATIZER] stanza ru pipeline ready")
-        except Exception as e:
-            stanza_ru = None
-            log.warning("[LEMMATIZER] stanza resources/pipeline not available: %s", e)
-
-        models_available = (spacy_en is not None) or (stanza_ru is not None)
-        if not models_available:
-            log.warning(
-                "[LEMMATIZER] No NLP models available; lemmatization degraded (empty lemma sets). "
-                "Will retry after cooldown=%.0fs.",
-                _INIT_RETRY_COOLDOWN_SEC,
-            )
-
-        _SPACY_EN = spacy_en
-        _STANZA_NLP_RU = stanza_ru
-        _MODELS_AVAILABLE = models_available
-        _MODELS_INIT_TRIED = True
-
-        return _MODELS_AVAILABLE
+    log.info(
+        "[LEMMA_CACHE] invalidated (epoch=%d) reason=%s",
+        _MODELS_EPOCH,
+        reason,
+    )
 
 
 def _notify_degraded_once() -> None:
@@ -159,61 +123,271 @@ def _notify_degraded_once() -> None:
         return
     _DEGRADED_WARNED = True
     log.warning(
-        "[LEMMATIZER] Lemmatization is running in degraded mode (no NLP models). "
-        "Ensure spaCy model 'en_core_web_sm' and/or stanza Russian resources are installed. "
-        "Lemmas will be empty until models become available."
+        "[LEMMATIZER] Lemmatization is in degraded mode: spaCy EN model and/or stanza RU resources are unavailable. "
+        "Lemmas may be empty until models are available."
     )
 
 
-# ─────────────────────────────────────────────────────────
-# Lemmatization
-# ─────────────────────────────────────────────────────────
-@functools.lru_cache(maxsize=10_000)
-def _extract_lemmas(text: str) -> FrozenSet[str]:
-    # Fast path: skip empty / too short
-    if not text or len(text) < 3:
-        return frozenset()
-
-    # Best-effort init; if failed, emit a single warning and occasionally retry via _try_init_models.
-    if not _try_init_models():
-        _notify_degraded_once()
-        # Throttled retry gate lives in _try_init_models itself, so no extra logic here.
-        return frozenset()
-
-    # Language detection (best-effort)
+def _lang_of(text: str) -> str:
+    """Best-effort language detection. Returns 'en' or 'ru'."""
     try:
         detected_lang = detect(text)
     except LangDetectException:
         detected_lang = "ru"
     except Exception:
         detected_lang = "ru"
+    return "en" if detected_lang == "en" else "ru"
 
-    lang = "en" if detected_lang == "en" else "ru"
+
+def _looks_like_torch_weights_only_error(err: Exception) -> bool:
+    """Heuristic to detect PyTorch 2.6+ 'weights_only' compatibility failures surfaced via stanza."""
+    msg = str(err)
+    needles = (
+        "Weights only load failed",
+        "WeightsUnpickler error",
+        "torch.serialization.add_safe_globals",
+        "weights_only",
+        "Unsupported global",
+    )
+    return any(n in msg for n in needles)
+
+
+def _torch_allowlist_stanza_safe_globals() -> bool:
+    """
+    Allowlist numpy globals required by torch weights-only unpickler (PyTorch 2.6+).
+    Only use if checkpoints are trusted.
+    """
+    try:
+        import numpy as np  # local import
+        import torch  # local import
+    except Exception as exc:
+        log.warning("[LEMMATIZER] torch/numpy import failed: %s", exc)
+        return False
+
+    ser = getattr(torch, "serialization", None)
+    add = getattr(ser, "add_safe_globals", None) if ser else None
+    if not callable(add):
+        log.warning(
+            "[LEMMATIZER] torch.serialization.add_safe_globals not available; cannot relax weights_only safely"
+        )
+        return False
+
+    try:
+        allow = [np.core.multiarray._reconstruct, np.ndarray, np.dtype]
+        if hasattr(np.core.multiarray, "scalar"):
+            allow.append(np.core.multiarray.scalar)
+        add(allow)
+        return True
+    except Exception as exc:
+        log.warning("[LEMMATIZER] torch safe-globals allowlist failed: %s", exc)
+        return False
+
+
+class _TorchLoadWeightsOnlyFalse:
+    """
+    Narrow monkeypatch: force torch.load(weights_only=False) during stanza pipeline init.
+    Only use if checkpoints are trusted.
+    """
+
+    def __enter__(self):
+        import torch  # local import
+
+        self._torch = torch
+        self._orig = torch.load
+
+        def _patched(*args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return self._orig(*args, **kwargs)
+
+        torch.load = _patched
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._torch.load = self._orig
+        return False
+
+
+def _try_init_models(*, force_retry: bool = False) -> Tuple[bool, bool]:
+    """
+    Lazily initialize spaCy EN + stanza RU.
+
+    Returns (spacy_ready, stanza_ready).
+    May trigger stanza resource download (lazy) if STANZA_AUTO_DOWNLOAD=True.
+
+    Thread-safety:
+    - Single initializer under _MODELS_INIT_LOCK.
+
+    Retry behavior:
+    - If init previously failed, allow throttled retry (cooldown) or explicit force_retry.
+    """
+    global _STANZA_NLP_RU, _SPACY_EN, _MODELS_INIT_TRIED, _LAST_INIT_ATTEMPT_TS
+    global _SPACY_READY, _STANZA_READY
+
+    now = time.time()
+
+    if (
+        _MODELS_INIT_TRIED
+        and (now - _LAST_INIT_ATTEMPT_TS) < _INIT_RETRY_COOLDOWN_SEC
+        and not force_retry
+    ):
+        return _SPACY_READY, _STANZA_READY
+
+    with _MODELS_INIT_LOCK:
+        now = time.time()
+        if (
+            _MODELS_INIT_TRIED
+            and (now - _LAST_INIT_ATTEMPT_TS) < _INIT_RETRY_COOLDOWN_SEC
+            and not force_retry
+        ):
+            return _SPACY_READY, _STANZA_READY
+
+        _LAST_INIT_ATTEMPT_TS = now
+        _MODELS_INIT_TRIED = True
+
+        prev_spacy = _SPACY_READY
+        prev_stanza = _STANZA_READY
+
+        # ---- spaCy EN ----
+        spacy_en = None
+        try:
+            spacy_en = spacy.load("en_core_web_sm")
+            _SPACY_READY = True
+            log.info("[LEMMATIZER] spaCy en_core_web_sm ready")
+        except Exception as e:
+            _SPACY_READY = False
+            log.warning("[LEMMATIZER] spaCy model not available: %s", e)
+
+        # ---- stanza RU ----
+        stanza_ru = None
+        _STANZA_DIR.mkdir(parents=True, exist_ok=True)
+
+        def _build_stanza_pipeline() -> stanza.Pipeline:
+            return stanza.Pipeline(
+                lang="ru",
+                processors="tokenize,pos,lemma",
+                use_gpu=False,
+                verbose=False,
+                dir=str(_STANZA_DIR),
+            )
+
+        try:
+            stanza_ru = _build_stanza_pipeline()
+            _STANZA_READY = True
+            log.info("[LEMMATIZER] stanza ru pipeline ready (dir=%s)", _STANZA_DIR)
+        except Exception as e:
+            _STANZA_READY = False
+
+            if _looks_like_torch_weights_only_error(e):
+                log.warning(
+                    "[LEMMATIZER] stanza ru pipeline blocked by torch serialization restrictions; "
+                    "trying safe-globals allowlist (dir=%s). Error=%s",
+                    _STANZA_DIR,
+                    e,
+                )
+
+                if _torch_allowlist_stanza_safe_globals():
+                    try:
+                        stanza_ru = _build_stanza_pipeline()
+                        _STANZA_READY = True
+                        log.info(
+                            "[LEMMATIZER] stanza ru pipeline ready after torch safe-globals allowlist (dir=%s)",
+                            _STANZA_DIR,
+                        )
+                    except Exception as e2:
+                        _STANZA_READY = False
+                        log.warning(
+                            "[LEMMATIZER] stanza still blocked after safe-globals allowlist; "
+                            "trying torch.load(weights_only=False) (dir=%s). Error=%s",
+                            _STANZA_DIR,
+                            e2,
+                        )
+
+                if not _STANZA_READY:
+                    try:
+                        with _TorchLoadWeightsOnlyFalse():
+                            stanza_ru = _build_stanza_pipeline()
+                        _STANZA_READY = True
+                        log.info(
+                            "[LEMMATIZER] stanza ru pipeline ready after forcing torch.load(weights_only=False) (dir=%s)",
+                            _STANZA_DIR,
+                        )
+                    except Exception as e3:
+                        _STANZA_READY = False
+                        log.warning(
+                            "[LEMMATIZER] stanza ru pipeline blocked even after weights_only=False; "
+                            "stanza disabled (dir=%s). Error=%s",
+                            _STANZA_DIR,
+                            e3,
+                        )
+            else:
+                log.warning("[LEMMATIZER] stanza pipeline not available: %s", e)
+
+                if _STANZA_AUTO_DOWNLOAD:
+                    try:
+                        log.info(
+                            "[LEMMATIZER] downloading stanza resources for ru (model_dir=%s)",
+                            _STANZA_DIR,
+                        )
+                        stanza.download(
+                            "ru",
+                            model_dir=str(_STANZA_DIR),
+                            processors="tokenize,pos,lemma",
+                            verbose=False,
+                        )
+                        stanza_ru = _build_stanza_pipeline()
+                        _STANZA_READY = True
+                        log.info(
+                            "[LEMMATIZER] stanza ru pipeline ready after download (dir=%s)",
+                            _STANZA_DIR,
+                        )
+                    except Exception as e2:
+                        _STANZA_READY = False
+                        log.warning("[LEMMATIZER] stanza download/init failed: %s", e2)
+
+        _SPACY_EN = spacy_en
+        _STANZA_NLP_RU = stanza_ru
+
+        if (_SPACY_READY and not prev_spacy) or (_STANZA_READY and not prev_stanza):
+            _invalidate_all_lemma_caches(
+                reason=f"models_became_available spacy={_SPACY_READY} stanza={_STANZA_READY}"
+            )
+
+        return _SPACY_READY, _STANZA_READY
+
+
+@functools.lru_cache(maxsize=10_000)
+def _extract_lemmas_cached(text: str, epoch: int) -> FrozenSet[str]:
+    """Cached lemmatization; epoch prevents degraded empty results from sticking forever."""
+    _ = epoch  # part of cache key; not used directly
+
+    if not text or len(text) < 3:
+        return frozenset()
+
+    spacy_ready, stanza_ready = _try_init_models(force_retry=False)
+    if not spacy_ready and not stanza_ready:
+        _notify_degraded_once()
+        return frozenset()
+
+    lang = _lang_of(text)
 
     if lang == "en":
-        if _SPACY_EN is None:
-            # If spaCy specifically missing, try a forced retry occasionally (still throttled by lock/cooldown).
-            _try_init_models(force_retry=False)
+        if not spacy_ready or _SPACY_EN is None:
             return frozenset()
         try:
             doc = _SPACY_EN(text)
             lemmas = {
                 tok.lemma_.lower()
                 for tok in doc
-                if tok.is_alpha and not tok.is_stop and len(tok) > 2
+                if tok.is_alpha and not tok.is_stop and len(tok.text) > 2
             }
             return frozenset(lemmas)
         except Exception:
             return frozenset()
 
-    # ru
-    if _STANZA_NLP_RU is None:
-        # If stanza specifically missing, allow cooldown-based retries.
-        _try_init_models(force_retry=False)
+    if not stanza_ready or _STANZA_NLP_RU is None:
         return frozenset()
 
     try:
-        # Stanza pipeline is not thread-safe in many setups; serialize calls.
         with _LEMMA_LOCK:
             doc = _STANZA_NLP_RU(text)
     except Exception:
@@ -225,17 +399,18 @@ def _extract_lemmas(text: str) -> FrozenSet[str]:
             for s in doc.sentences
             for w in s.words
             if w.lemma
-               and len(w.lemma) > 2
-               and w.upos in cfg.GOOD_POS
-               and w.lemma.lower() not in cfg.STOP_WORDS
+            and len(w.lemma) > 2
+            and w.upos in cfg.GOOD_POS
+            and w.lemma.lower() not in cfg.STOP_WORDS
         }
         return frozenset(lemmas)
     except Exception:
         return frozenset()
 
 
-# Public alias
-extract_lemmas = _extract_lemmas
+def extract_lemmas(text: str) -> FrozenSet[str]:
+    """Public API: lemmatize text with epoch-aware caching."""
+    return _extract_lemmas_cached(text, _MODELS_EPOCH)
 
 
 def _chunk_hash(text: str) -> str:
@@ -287,16 +462,15 @@ def load_saved_lemmas() -> None:
         return
     try:
         data = json.loads(LEMMA_INDEX_FILE.read_text("utf-8"))
-        for fname, lst in data.items():
-            FILE_LEMMAS[fname] = frozenset(lst)
+        if isinstance(data, dict):
+            for fname, lst in data.items():
+                if isinstance(lst, list):
+                    FILE_LEMMAS[fname] = frozenset(lst)
         log.info("[LEMMA_CACHE] Loaded file-lemmas: %d files", len(FILE_LEMMAS))
     except Exception as e:
         log.warning("[LEMMA_CACHE] Load lemmas error: %s", e)
 
 
-# ─────────────────────────────────────────────────────────
-# Async update of FILE_LEMMAS for changed files
-# ─────────────────────────────────────────────────────────
 def _read_file(fp: Path) -> str:
     try:
         return fp.read_text("utf-8", "ignore")
@@ -316,9 +490,9 @@ async def _compute_and_store_lemmas(fp: Path) -> None:
 
 
 async def update_file_lemmas_async(
-        docs: List[Path],
-        stored_hashes: Dict[str, str],
-        new_hashes: Dict[str, str],
+    docs: List[Path],
+    stored_hashes: Dict[str, str],
+    new_hashes: Dict[str, str],
 ) -> List[Path]:
     changed = [d for d in docs if stored_hashes.get(d.name) != new_hashes.get(d.name)]
     if not changed:

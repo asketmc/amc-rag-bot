@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -51,7 +52,9 @@ class _AsyncSessionHolder:
     async def get(self) -> ClientSession:
         async with self._lock:
             if self._session is None or self._session.closed:
-                self._session = ClientSession(connector=TCPConnector(limit=cfg.HTTP_CONN_LIMIT))
+                self._session = ClientSession(
+                    connector=TCPConnector(limit=cfg.HTTP_CONN_LIMIT)
+                )
             return self._session
 
     async def close(self) -> None:
@@ -62,6 +65,24 @@ class _AsyncSessionHolder:
 
 
 _SESSION_HOLDER = _AsyncSessionHolder()
+
+
+def _configure_logging(*, verbose: bool) -> None:
+    """
+    Keep semantic bot logs; suppress discord.py transport/debug noise.
+
+    This config is local to loggers' levels and does not require changes in main.py.
+    """
+    disc_log.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    # discord.py internal chatter
+    logging.getLogger("discord").setLevel(logging.WARNING)
+    logging.getLogger("discord.gateway").setLevel(logging.WARNING)
+    logging.getLogger("discord.client").setLevel(logging.WARNING)
+    logging.getLogger("discord.http").setLevel(logging.WARNING)
+
+    # optional: aiohttp can be noisy too
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
 
 def _require_state() -> AppDeps:
@@ -104,8 +125,21 @@ def _split_for_discord(text: str, limit: int = 2000) -> list[str]:
     return parts
 
 
+def _qhash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+
+
 async def _send_long(ctx: commands.Context, text: str, limit: int = 1900) -> None:
-    for chunk in _split_for_discord(text, limit):
+    parts = _split_for_discord(text, limit)
+    disc_log.debug(
+        "send parts=%s total_len=%s limit=%s ch_id=%s",
+        len(parts),
+        len(text),
+        limit,
+        getattr(ctx.channel, "id", "?"),
+    )
+    for i, chunk in enumerate(parts, start=1):
+        disc_log.debug("send_part i=%s len=%s", i, len(chunk))
         await ctx.send(chunk)
 
 
@@ -115,7 +149,11 @@ _shutdown_flag = False
 
 
 def _build_bot() -> commands.Bot:
-    intents = discord.Intents.all()
+    # Minimal intents for prefix commands; avoids presence/member noise.
+    intents = discord.Intents.none()
+    intents.guilds = True
+    intents.messages = True
+    intents.message_content = True
     return commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -138,16 +176,15 @@ def _check_channel_allowed():
 
 
 def _read_prompt_file(prompt_path: Path) -> str:
-    # Keep IO small and explicit; raise to caller for classification.
     return prompt_path.read_text(encoding="utf-8")
 
 
 async def _answer_rag(
-        ctx: commands.Context,
-        question_raw: str,
-        *,
-        prompt_path: Path,
-        force_local: bool | None = None,
+    ctx: commands.Context,
+    question_raw: str,
+    *,
+    prompt_path: Path,
+    force_local: bool | None = None,
 ) -> None:
     deps = _require_state()
 
@@ -163,8 +200,19 @@ async def _answer_rag(
     is_blocked = deps.is_openrouter_blocked()
     use_remote = (force_local is None and not is_blocked) or (force_local is False)
 
+    disc_log.debug(
+        "rq user_id=%s ch_id=%s cmd=%s qlen=%s qhash=%s mode=%s",
+        getattr(ctx.author, "id", "?"),
+        getattr(ctx.channel, "id", "?"),
+        getattr(getattr(ctx, "command", None), "qualified_name", "?"),
+        len(q),
+        _qhash(q),
+        "remote" if use_remote else "local",
+    )
+
     await ctx.send("🧠 Thinking locally…" if not use_remote else "🔍 Thinking…")
 
+    start = time.monotonic()
     try:
         async with cfg.REQUEST_SEMAPHORE:
             sys_prompt = _read_prompt_file(Path(prompt_path))
@@ -196,6 +244,13 @@ async def _answer_rag(
         return
 
     out = answer or "❌ No answer."
+    disc_log.debug(
+        "rs user_id=%s ch_id=%s olen=%s dt_ms=%s",
+        getattr(ctx.author, "id", "?"),
+        getattr(ctx.channel, "id", "?"),
+        len(out),
+        int((time.monotonic() - start) * 1000),
+    )
     await _send_long(ctx, out)
 
     if force_local is None and is_blocked:
@@ -306,19 +361,22 @@ async def _shutdown_once(bot: commands.Bot) -> None:
 
 
 def run_bot(
-        *,
-        token: str,
-        index: Any,
-        retriever: Any,
-        generate_rag_answer: RagGenFn,
-        query_model: QueryModelFn,
-        call_local_llm: CallLocalFn,
-        build_index: BuildIndexFn,
-        is_openrouter_blocked: IsBlockedFn,
-        on_core_shutdown: Optional[ShutdownFn] = None,
+    *,
+    token: str,
+    index: Any,
+    retriever: Any,
+    generate_rag_answer: RagGenFn,
+    query_model: QueryModelFn,
+    call_local_llm: CallLocalFn,
+    build_index: BuildIndexFn,
+    is_openrouter_blocked: IsBlockedFn,
+    on_core_shutdown: Optional[ShutdownFn] = None,
 ) -> None:
     global _STATE, _bot, _shutdown_flag
     _shutdown_flag = False
+
+    _configure_logging(verbose=bool(getattr(cfg, "DEBUG", False)))
+
     _STATE = AppDeps(
         index=index,
         retriever=retriever,
@@ -335,19 +393,22 @@ def run_bot(
 
 
 async def start_bot_async(
-        *,
-        token: str,
-        index: Any,
-        retriever: Any,
-        generate_rag_answer: RagGenFn,
-        query_model: QueryModelFn,
-        call_local_llm: CallLocalFn,
-        build_index: BuildIndexFn,
-        is_openrouter_blocked: IsBlockedFn,
-        on_core_shutdown: Optional[ShutdownFn] = None,
+    *,
+    token: str,
+    index: Any,
+    retriever: Any,
+    generate_rag_answer: RagGenFn,
+    query_model: QueryModelFn,
+    call_local_llm: CallLocalFn,
+    build_index: BuildIndexFn,
+    is_openrouter_blocked: IsBlockedFn,
+    on_core_shutdown: Optional[ShutdownFn] = None,
 ) -> None:
     global _STATE, _bot, _shutdown_flag
     _shutdown_flag = False
+
+    _configure_logging(verbose=bool(getattr(cfg, "DEBUG", False)))
+
     _STATE = AppDeps(
         index=index,
         retriever=retriever,

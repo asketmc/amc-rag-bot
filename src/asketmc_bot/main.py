@@ -17,7 +17,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from dotenv import load_dotenv
 from llama_index.core import VectorStoreIndex
@@ -48,6 +48,7 @@ def load_settings() -> dict:
     """Load .env and config values with safe defaults."""
     current = Path(__file__).resolve()
     if current.parent.name == "asketmc_bot":
+        # .../<repo>/src/asketmc_bot/main.py -> parents[2] == <repo>
         project_root = current.parents[2]
     else:
         project_root = current.parent
@@ -56,7 +57,8 @@ def load_settings() -> dict:
         project_root / ".env",
         project_root / ".env.local",
         project_root / ".env-example",
-        ]
+    ]
+
     env_loaded = False
     for env_path in candidates:
         if env_path.exists():
@@ -109,15 +111,15 @@ def make_llm_config(s: dict) -> LLMConfig:
 
 # ── Core RAG logic ────────────────────────────────────────────────────────────
 async def generate_rag_answer(
-        retriever: Any,
-        query: str,
-        sys_prompt: str,
-        llm_client: LLMClient,
-        settings: dict,
-        **kwargs: Any,
+    retriever: Any,
+    query: str,
+    sys_prompt: str,
+    llm_client: LLMClient,
+    settings: dict,
+    **kwargs: Any,
 ) -> str:
     """Build a RAG prompt and generate an answer via the LLM."""
-    use_remote = kwargs.get("use_remote", True)
+    use_remote = bool(kwargs.get("use_remote", True))
 
     qlem = extract_lemmas(query)
     raw_nodes = await retriever.aretrieve(query)
@@ -162,14 +164,14 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     llm.attach_loop(loop)
 
-    _shutdown_started = False
+    shutdown_started = False
 
     async def shutdown() -> None:
         """Graceful async shutdown for core services."""
-        nonlocal _shutdown_started
-        if _shutdown_started:
+        nonlocal shutdown_started
+        if shutdown_started:
             return
-        _shutdown_started = True
+        shutdown_started = True
 
         log.info("Shutting down core systems...")
         try:
@@ -191,7 +193,6 @@ async def main() -> None:
         """Synchronous breaker check for bot throttling decisions."""
         return llm.is_remote_blocked_sync()
 
-    # Start Discord bot
     bot_task = asyncio.create_task(
         discord_module.start_bot_async(
             token=settings["discord_token"],
@@ -208,7 +209,6 @@ async def main() -> None:
         )
     )
 
-    # If bot task crashes, trigger shutdown to avoid hanging forever.
     def _bot_done(t: asyncio.Task) -> None:
         try:
             _ = t.result()
@@ -219,7 +219,6 @@ async def main() -> None:
 
     bot_task.add_done_callback(_bot_done)
 
-    # Signal handling
     def _signal_handler() -> None:
         asyncio.create_task(shutdown())
 
@@ -232,7 +231,6 @@ async def main() -> None:
 
     await stop_event.wait()
 
-    # Cancel bot gracefully
     if not bot_task.done():
         bot_task.cancel()
     try:
@@ -241,8 +239,8 @@ async def main() -> None:
         pass
 
 
-# ── Entrypoint ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def cli() -> None:
+    """Console-script entrypoint (sync wrapper for async main())."""
     if sys.platform.startswith("win"):
         try:
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -253,3 +251,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logging.getLogger("asketmc.main").warning("Interrupted by user.")
+
+
+if __name__ == "__main__":
+    cli()

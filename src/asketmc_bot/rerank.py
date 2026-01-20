@@ -68,7 +68,6 @@ _EXECUTOR_WORKERS = int(getattr(cfg, "EXECUTOR_WORKERS", 4))
 _PREDICT_TIMEOUT_SEC = float(getattr(cfg, "PREDICT_TIMEOUT_SEC", 120.0))
 _PREDICT_RETRIES = int(getattr(cfg, "PREDICT_RETRIES", 1))  # 0 means no retries
 
-# Best-effort shutdown wait for an in-flight inference.
 _SHUTDOWN_WAIT_SEC = float(getattr(cfg, "RERANK_SHUTDOWN_WAIT_SEC", 10.0))
 
 # -----------------------------------------------------------------------------
@@ -79,7 +78,6 @@ _RERANKER: Optional[CrossEncoder] = None
 _EXECUTOR: Optional[ThreadPoolExecutor] = None
 _INIT_LOCK = asyncio.Lock()
 
-# Tracks current inference to avoid overlapping inference and to coordinate shutdown.
 _INFLIGHT: Optional[asyncio.Future[List[float]]] = None
 
 # -----------------------------------------------------------------------------
@@ -127,8 +125,22 @@ def _node_text(n: NodeWithScore) -> str:
     return ""
 
 
+def _node_id(n: NodeWithScore) -> str:
+    """Extract stable node identifier for logs."""
+    node = getattr(n, "node", n)
+    for attr in ("node_id", "id_", "id", "ref_doc_id"):
+        if hasattr(node, attr):
+            try:
+                v = getattr(node, attr)
+                if v:
+                    return str(v)
+            except Exception:
+                continue
+    return "n/a"
+
+
 def _filter_pairs(
-        query: str, nodes: List[NodeWithScore]
+    query: str, nodes: List[NodeWithScore]
 ) -> Tuple[List[List[str]], List[NodeWithScore]]:
     """Return (query, doc) pairs and corresponding nodes, skipping empty docs."""
     cand_nodes: List[NodeWithScore] = nodes[:_RERANK_INPUT_K]
@@ -142,9 +154,9 @@ def _filter_pairs(
             filtered_nodes.append(n)
         else:
             _LOG.debug(
-                "[_filter_pairs] skip empty doc idx=%d id=%r",
+                "[_filter_pairs] skip empty doc idx=%d node_id=%s",
                 idx,
-                getattr(getattr(n, "node", n), "id", "n/a"),
+                _node_id(n),
             )
 
     _LOG.debug(
@@ -155,9 +167,10 @@ def _filter_pairs(
     return pairs, filtered_nodes
 
 
-def _clear_inflight_cb(_fut: asyncio.Future) -> None:
+def _clear_inflight_cb(fut: asyncio.Future) -> None:
     global _INFLIGHT
-    _INFLIGHT = None
+    if _INFLIGHT is fut:
+        _INFLIGHT = None
 
 
 # -----------------------------------------------------------------------------
@@ -196,13 +209,11 @@ async def init_reranker(force: bool = False) -> None:
                     mem_after = torch.cuda.memory_allocated()
                     _LOG.info(
                         "[init_reranker] CUDA cache cleared: %.2f -> %.2f MB",
-                        mem_before / (1024 ** 2),
-                        mem_after / (1024 ** 2),
-                        )
+                        mem_before / (1024**2),
+                        mem_after / (1024**2),
+                    )
             except Exception as exc:  # pragma: no cover
-                _LOG.warning(
-                    "[init_reranker] error during previous model cleanup: %s", exc
-                )
+                _LOG.warning("[init_reranker] error during previous model cleanup: %s", exc)
 
         device = _choose_device()
         _LOG.info(
@@ -233,7 +244,6 @@ async def shutdown_reranker() -> None:
     async with _INIT_LOCK:
         _LOG.info("[shutdown_reranker] called")
 
-        # Best-effort: wait a bit for in-flight inference to finish.
         inflight = _INFLIGHT
         if inflight is not None and not inflight.done():
             try:
@@ -244,8 +254,6 @@ async def shutdown_reranker() -> None:
                     "skipping model/CUDA cleanup",
                     _SHUTDOWN_WAIT_SEC,
                 )
-                # Do not clear CUDA cache or delete model while an inference thread may still be using it.
-                # Best-effort executor shutdown without waiting; prevents new tasks from being queued.
                 if _EXECUTOR is not None:
                     try:
                         _EXECUTOR.shutdown(wait=False, cancel_futures=True)
@@ -273,13 +281,11 @@ async def shutdown_reranker() -> None:
                         mem_after = torch.cuda.memory_allocated()
                         _LOG.info(
                             "[shutdown_reranker] CUDA cache cleared: %.2f -> %.2f MB",
-                            mem_before / (1024 ** 2),
-                            mem_after / (1024 ** 2),
-                            )
+                            mem_before / (1024**2),
+                            mem_after / (1024**2),
+                        )
                 except Exception as exc:  # pragma: no cover
-                    _LOG.warning(
-                        "[shutdown_reranker] error during model cleanup: %s", exc
-                    )
+                    _LOG.warning("[shutdown_reranker] error during model cleanup: %s", exc)
         finally:
             _INFLIGHT = None
             _LOG.info("[shutdown_reranker] resources released")
@@ -312,77 +318,127 @@ async def rerank(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]:
     while attempt <= _PREDICT_RETRIES:
         attempt += 1
 
-        async with _INIT_LOCK:
-            # If an inference is already running, do not overlap work on the same model/executor.
-            if _INFLIGHT is not None and not _INFLIGHT.done():
-                _LOG.info("[rerank] inference already in-flight -> []")
+        # Ensure initialized WITHOUT holding _INIT_LOCK here (avoid deadlock).
+        if _RERANKER is None or _EXECUTOR is None:
+            _LOG.info("[rerank] reranker not initialized; attempting init")
+            try:
+                await init_reranker(force=False)
+            except Exception as exc:
+                _LOG.exception("[rerank] init error -> []: %s", exc)
+                return []
+            if _RERANKER is None or _EXECUTOR is None:
+                _LOG.error("[rerank] init failed -> []")
                 return []
 
-            if _RERANKER is None or _EXECUTOR is None:
-                _LOG.info("[rerank] reranker not initialized; attempting init")
-                await init_reranker(force=False)
-                if _RERANKER is None or _EXECUTOR is None:
-                    _LOG.error("[rerank] init failed -> []")
-                    return []
+        # If another inference is running, wait for it (do not return [] silently).
+        inflight_to_wait: Optional[asyncio.Future[List[float]]] = None
+        async with _INIT_LOCK:
+            if _INFLIGHT is not None and not _INFLIGHT.done():
+                inflight_to_wait = _INFLIGHT
 
-            model = _RERANKER
-            executor = _EXECUTOR
-
-            def _predict_once() -> List[float]:
-                t0 = time.perf_counter()
-                scores = model.predict(
-                    pairs,
-                    batch_size=_BATCH_SIZE,
-                    convert_to_numpy=True,
-                    show_progress_bar=False,
+        if inflight_to_wait is not None:
+            _LOG.info("[rerank] another inference in-flight; awaiting completion")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(inflight_to_wait),
+                    timeout=_PREDICT_TIMEOUT_SEC,
                 )
-                dt = time.perf_counter() - t0
-                _LOG.info(
-                    "[_predict_once] model=%s items=%d batch=%d took=%.3fs",
-                    _RERANKER_MODEL_NAME,
-                    len(pairs),
-                    _BATCH_SIZE,
-                    dt,
+            except asyncio.TimeoutError as exc:
+                _LOG.warning(
+                    "[rerank] prior in-flight inference did not finish within %.1fs -> []",
+                    _PREDICT_TIMEOUT_SEC,
                 )
-                try:
-                    return scores.tolist()  # type: ignore[attr-defined]
-                except Exception:
-                    return list(scores)
+                last_err = exc
+                return []
+            except Exception as exc:
+                _LOG.warning(
+                    "[rerank] prior in-flight inference failed; continuing: %s",
+                    exc,
+                    exc_info=True,
+                )
+            # Loop again: either inflight cleared or will be handled again.
+            continue
 
-            # Schedule under lock so shutdown can't invalidate executor between snapshot and submit.
-            fut: asyncio.Future[List[float]] = loop.run_in_executor(executor, _predict_once)
+        model = _RERANKER
+        executor = _EXECUTOR
+        if model is None or executor is None:
+            _LOG.error("[rerank] model/executor unexpectedly missing -> []")
+            return []
+
+        def _predict_once() -> List[float]:
+            t0 = time.perf_counter()
+            scores = model.predict(
+                pairs,
+                batch_size=_BATCH_SIZE,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            dt = time.perf_counter() - t0
+            _LOG.info(
+                "[_predict_once] model=%s items=%d batch=%d took=%.3fs",
+                _RERANKER_MODEL_NAME,
+                len(pairs),
+                _BATCH_SIZE,
+                dt,
+            )
+            try:
+                return scores.tolist()  # type: ignore[attr-defined]
+            except Exception:
+                return list(scores)
+
+        fut: Optional[asyncio.Future[List[float]]] = None
+        async with _INIT_LOCK:
+            if _INFLIGHT is not None and not _INFLIGHT.done():
+                # A concurrent caller started work between checks; retry loop to await it.
+                _LOG.info("[rerank] inference became in-flight concurrently; retry")
+                continue
+
+            fut = loop.run_in_executor(executor, _predict_once)
             _INFLIGHT = fut
             fut.add_done_callback(_clear_inflight_cb)
 
         try:
-            scores = await asyncio.wait_for(asyncio.shield(fut), timeout=_PREDICT_TIMEOUT_SEC)
+            assert fut is not None
+            scores = await asyncio.wait_for(
+                asyncio.shield(fut), timeout=_PREDICT_TIMEOUT_SEC
+            )
 
-            ranked: List[Tuple[NodeWithScore, float]] = sorted(
-                zip(valid_nodes, scores), key=lambda x: x[1], reverse=True
+            ranked = sorted(
+                zip(valid_nodes, scores),
+                key=lambda x: x[1],
+                reverse=True,
             )
             if not ranked:
                 _LOG.warning("[rerank] empty result after scoring -> []")
                 return []
 
+            # Persist rerank score into NodeWithScore.score for downstream consumers.
+            for n, s in ranked:
+                try:
+                    n.score = float(s)
+                except Exception:
+                    pass
+
             top_k = _RERANK_OUTPUT_K
             out = [n for n, _ in ranked[:top_k]]
             _LOG.debug(
-                "[rerank] top%d ids=%s",
+                "[rerank] top%d node_ids=%s",
                 top_k,
-                [getattr(getattr(n, "node", n), "id", "n/a") for n in out],
+                [_node_id(n) for n in out],
             )
             return out
 
         except asyncio.TimeoutError as exc:
             last_err = exc
             _LOG.warning(
-                "[rerank] inference wait timeout after %.1fs (attempt %d/%d) -> []",
+                "[rerank] inference wait timeout after %.1fs (attempt %d/%d)",
                 _PREDICT_TIMEOUT_SEC,
                 attempt,
                 _PREDICT_RETRIES + 1,
-                )
-            # Underlying thread work may still be running; block overlapping inference via _INFLIGHT guard.
-            return []
+            )
+            if attempt > _PREDICT_RETRIES:
+                return []
+            await asyncio.sleep(min(0.25 * attempt, 1.0))
 
         except Exception as exc:
             last_err = exc
@@ -391,14 +447,14 @@ async def rerank(query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]:
                 attempt,
                 _PREDICT_RETRIES + 1,
                 exc,
-                )
-
-        if attempt <= _PREDICT_RETRIES:
+            )
+            if attempt > _PREDICT_RETRIES:
+                return []
             await asyncio.sleep(min(0.25 * attempt, 1.0))
 
     _LOG.error(
         "[rerank] giving up after %d attempts -> [] (%s)",
         _PREDICT_RETRIES + 1,
         last_err,
-        )
+    )
     return []

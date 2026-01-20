@@ -70,7 +70,7 @@ TOP_K: int = 24
 MIN_SCORE: float = 0.35
 
 # Remote / local LLM defaults (OpenRouter / Ollama)
-OR_MODEL: str = "deepseek/deepseek-chat:free"
+OR_MODEL: str = "xiaomi/mimo-v2-flash:free"
 LOCAL_MODEL: str = "llama3.1:8b"
 OR_MAX_TOKENS: int = 2048
 API_URL: str = "https://openrouter.ai/api/v1/chat/completions"
