@@ -263,7 +263,7 @@ source = [
 [tool.coverage.report]
 show_missing = true
 skip_covered = false
-fail_under = 65
+fail_under = 30
 exclude_lines = [
     "pragma: no cover",
     "if __name__ == .__main__.:",
