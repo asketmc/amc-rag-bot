@@ -9,21 +9,39 @@ Tests for Discord bot functionality (P2 Major Feature)
 """
 import pytest
 import sys
-from pathlib import Path
 from unittest.mock import Mock, AsyncMock, patch
 import time
 
-# Add src to path
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src" / "asketmc_bot"))
 
-# Mock discord before importing
-sys.modules["discord"] = Mock()
-sys.modules["discord.ext"] = Mock()
-sys.modules["discord.ext.commands"] = Mock()
-sys.modules["aiohttp"] = Mock()
+# ---------------------------------------------------------------------------
+# Isolated discord / aiohttp stubs with proper teardown (Fix #4)
+# ---------------------------------------------------------------------------
+_DISCORD_STUB_MODULES = ("discord", "discord.ext", "discord.ext.commands", "aiohttp")
 
-from asketmc_bot import discord_bot
+
+@pytest.fixture(autouse=True, scope="module")
+def _mock_discord_modules():
+    """Install discord/aiohttp stubs before the module is imported and restore after."""
+    originals = {name: sys.modules.get(name) for name in _DISCORD_STUB_MODULES}
+    for name in _DISCORD_STUB_MODULES:
+        sys.modules[name] = Mock()
+
+    # Force (re-)import so discord_bot sees the stubs
+    global discord_bot
+    from asketmc_bot import discord_bot as _db
+    discord_bot = _db
+
+    yield
+
+    for name in _DISCORD_STUB_MODULES:
+        if originals[name] is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = originals[name]
+
+
+# Lazy module-level reference; populated by _mock_discord_modules fixture
+discord_bot = None  # type: ignore[assignment]
 
 
 class TestInputSanitization:
@@ -208,18 +226,17 @@ class TestAdminCommandChecks:
         check_decorator = discord_bot._check_admin_only()
         assert callable(check_decorator)
 
+    @pytest.mark.skip(reason="predicate introspection not yet implemented")
     def test_admin_check_allows_admin(self):
         """Admin user passes admin check."""
         with patch("asketmc_bot.discord_bot.cfg.ADMIN_IDS", {123}):
             check_decorator = discord_bot._check_admin_only()
-            # Get the actual predicate function
-            # (Complex due to decorator structure, simplified test)
 
+    @pytest.mark.skip(reason="predicate introspection not yet implemented")
     def test_admin_check_blocks_non_admin(self):
         """Non-admin user fails admin check."""
         with patch("asketmc_bot.discord_bot.cfg.ADMIN_IDS", {123}):
             check_decorator = discord_bot._check_admin_only()
-            # Would need to create mock context to fully test
 
 
 class TestChannelChecks:
