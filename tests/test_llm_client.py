@@ -13,45 +13,18 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
-from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-# Ensure src is importable
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in asyncio.sys.path:  # type: ignore[attr-defined]
-    # Avoid importing sys at module scope into a test that also uses asyncio.sys in type-checkers.
-    import sys as _sys
-
-    if str(SRC) not in _sys.path:
-        _sys.path.insert(0, str(SRC))
-
-import asketmc_bot.llm_client as llm_mod  # noqa: E402
-from asketmc_bot.llm_client import (  # noqa: E402
+import asketmc_bot.llm_client as llm_mod
+from asketmc_bot.llm_client import (
     AsyncSessionHolder,
     CircuitBreaker,
     LLMClient,
     LLMConfig,
 )
 
-
-@pytest.fixture
-def config() -> LLMConfig:
-    return LLMConfig(
-        api_url="https://test.example/api",
-        or_model="test/model",
-        or_max_tokens=128,
-        openrouter_api_key="test_key",
-        ollama_url="http://localhost:11434/api/generate",
-        local_model="test:local",
-        http_conn_limit=2,
-        or_retries=2,
-        http_timeout_total=10,
-        breaker_base_block_sec=1,
-        breaker_max_block_sec=5,
-    )
 
 
 class _FakeClock:
@@ -182,15 +155,15 @@ class TestAsyncSessionHolder:
 
 class TestLLMClient:
     @pytest.mark.asyncio
-    async def test_query_model_requires_input(self, config):
-        client = LLMClient(config)
+    async def test_query_model_requires_input(self, llm_config):
+        client = LLMClient(llm_config)
         with pytest.raises(ValueError, match="requires either"):
             await client.query_model()
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_remote_success_no_fallback(self, config):
-        client = LLMClient(config)
+    async def test_remote_success_no_fallback(self, llm_config):
+        client = LLMClient(llm_config)
 
         with (
             patch.object(client, "_call_openrouter", new_callable=AsyncMock) as mock_or,
@@ -207,8 +180,8 @@ class TestLLMClient:
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_remote_failure_triggers_local_fallback_and_breaker(self, config):
-        client = LLMClient(config)
+    async def test_remote_failure_triggers_local_fallback_and_breaker(self, llm_config):
+        client = LLMClient(llm_config)
 
         with (
             patch.object(client, "_call_openrouter", new_callable=AsyncMock) as mock_or,
@@ -236,8 +209,8 @@ class TestLLMClient:
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_local_llm_timeout_handling(self, config):
-        client = LLMClient(config)
+    async def test_local_llm_timeout_handling(self, llm_config):
+        client = LLMClient(llm_config)
 
         class _TimeoutCM:
             async def __aenter__(self):
@@ -256,7 +229,7 @@ class TestLLMClient:
 
         await client.close()
 
-    def test_is_remote_blocked_sync_cross_thread(self, config):
+    def test_is_remote_blocked_sync_cross_thread(self, llm_config):
         """
         Deterministic cross-thread test:
         - Run an event loop in a background thread
@@ -269,7 +242,7 @@ class TestLLMClient:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-            client = LLMClient(config)
+            client = LLMClient(llm_config)
             client.attach_loop(loop)
 
             q.put((client, loop))
