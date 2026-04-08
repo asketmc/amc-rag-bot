@@ -8,12 +8,6 @@ Tests for configuration loading and validation (P1 Critical Feature)
 - Default values
 """
 import pytest
-import sys
-from pathlib import Path
-
-# Add src to path
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src" / "asketmc_bot"))
 
 from asketmc_bot import config as cfg
 class TestPathConfiguration:
