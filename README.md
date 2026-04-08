@@ -5,6 +5,8 @@
 ![NLP](https://img.shields.io/badge/NLP-Stanza%20%7C%20spaCy-purple)
 ![CI](https://img.shields.io/badge/CI-GitHub%20Actions-blue)
 
+**Coverage report (GitHub Pages):**
+https://asketmc.github.io/amc-rag-bot/coverage/
 
 # Asketmc RAG Discord Bot
 
@@ -199,6 +201,29 @@ LLM/
 ```
 
 ---
+
+## Test Coverage Matrix
+
+Coverage is configured via `coverage.py` in `pyproject.toml` and executed through `tox`.
+
+Local quick run:
+
+```powershell
+python -m pip install -e ".[test,dev]"
+python -m tox -e py310
+python -m tox -e coverage
+```
+
+Generated artifacts:
+
+- `coverage.xml` (machine-readable report)
+- `htmlcov/` (HTML coverage report)
+
+In GitHub Actions:
+
+- `.github/workflows/coverage-pages.yml` runs tests with coverage and generates terminal, HTML, and XML reports
+- Artifacts are uploaded as `coverage-html` and `coverage-xml`
+- On `master`, HTML coverage is published to GitHub Pages under `/coverage/`
 
 ---
 
