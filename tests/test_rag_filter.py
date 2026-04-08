@@ -7,46 +7,11 @@ Tests for RAG filtering and context building (P1 Critical Feature)
 - Cache functionality
 - Lemma matching
 """
-import asyncio
-import sys
-from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
-# Add src to path
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src" / "asketmc_bot"))
-
-# Mock llama_index before importing rag_filter
-llama_pkg = MagicMock()
-llama_core = MagicMock()
-
-
-class MockNode:
-    def __init__(self, text: str = "", metadata=None):
-        self.text = text
-        self.metadata = metadata or {}
-        self.id = f"node_{id(self)}"
-
-    def get_content(self, metadata_mode=None):
-        return self.text
-
-
-class MockNodeWithScore:
-    def __init__(self, text: str = "", score: float = 0.5, lemmas=None):
-        self.node = MockNode(text, {"lemmas": lemmas or []})
-        self.score = score
-
-
-llama_core.schema = MagicMock()
-llama_core.schema.NodeWithScore = MockNodeWithScore
-sys.modules["llama_index"] = llama_pkg
-sys.modules["llama_index.core"] = llama_core
-sys.modules["llama_index.core.schema"] = llama_core.schema
-
-# Now import after mocking
-from asketmc_bot.rag_filter import (  # noqa: E402
+from tests import bootstrap
+from asketmc_bot.rag_filter import (
     _cache_key,
     build_context,
     get_filtered_nodes,
@@ -58,56 +23,49 @@ class TestNodeFiltering:
     """Test node filtering with lemma matching and score thresholds."""
 
     @pytest.mark.asyncio
-    async def test_empty_nodes_returns_empty(self):
+    async def test_empty_nodes_returns_empty(self, purge_cache):
         """Empty input returns empty list."""
         result = await get_filtered_nodes([], frozenset())
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_filters_by_score_threshold(self):
+    async def test_filters_by_score_threshold(self, purge_cache, high_low_nodes, query_lemmas):
         """Nodes below score threshold are filtered out."""
-        nodes = [
-            MockNodeWithScore(text="high score", score=0.9, lemmas=["test"]),
-            MockNodeWithScore(text="low score", score=0.1, lemmas=["test"]),
-        ]
-        qlem = frozenset(["test"])
-
-        result = await get_filtered_nodes(nodes, qlem)
+        result = await get_filtered_nodes(high_low_nodes, query_lemmas)
         assert len(result) >= 1
         assert any(n.node.text == "high score" for n in result)
 
     @pytest.mark.asyncio
-    async def test_filters_by_lemma_intersection(self):
+    async def test_filters_by_lemma_intersection(self, purge_cache):
         """Nodes with lemma overlap are prioritized."""
         nodes = [
-            MockNodeWithScore(text="matching", score=0.5, lemmas=["apple", "orange"]),
-            MockNodeWithScore(text="no match", score=0.5, lemmas=["banana"]),
+            bootstrap.MockNodeWithScore(text="matching", score=0.5, lemmas=["apple", "orange"]),
+            bootstrap.MockNodeWithScore(text="no match", score=0.5, lemmas=["banana"]),
         ]
         qlem = frozenset(["apple"])
 
         result = await get_filtered_nodes(nodes, qlem)
-        if result:
-            assert any("apple" in n.node.metadata.get("lemmas", []) for n in result)
+        assert result, "expected non-empty result for matching lemma"
+        assert any("apple" in n.node.metadata.get("lemmas", []) for n in result)
 
     @pytest.mark.asyncio
-    async def test_respects_top_k_limit(self):
+    async def test_respects_top_k_limit(self, purge_cache, query_lemmas):
         """Returns at most TOP_K nodes."""
-        nodes = [MockNodeWithScore(text=f"doc{i}", score=0.9, lemmas=["test"]) for i in range(100)]
-        qlem = frozenset(["test"])
+        nodes = [
+            bootstrap.MockNodeWithScore(text=f"doc{i}", score=0.9, lemmas=["test"])
+            for i in range(100)
+        ]
 
-        result = await get_filtered_nodes(nodes, qlem)
+        result = await get_filtered_nodes(nodes, query_lemmas)
         assert len(result) <= 30  # reasonable upper bound
 
     @pytest.mark.asyncio
-    async def test_cache_hit_returns_cached_result(self):
+    async def test_cache_hit_returns_cached_result(self, purge_cache, single_high_node, query_lemmas):
         """Second call with same inputs returns cached result."""
-        purge_filter_cache()
+        nodes = [single_high_node]
 
-        nodes = [MockNodeWithScore(text="cached", score=0.8, lemmas=["test"])]
-        qlem = frozenset(["test"])
-
-        result1 = await get_filtered_nodes(nodes, qlem)
-        result2 = await get_filtered_nodes(nodes, qlem)
+        result1 = await get_filtered_nodes(nodes, query_lemmas)
+        result2 = await get_filtered_nodes(nodes, query_lemmas)
 
         assert len(result1) == len(result2)
 
@@ -115,60 +73,62 @@ class TestNodeFiltering:
 class TestContextBuilding:
     """Test context assembly from filtered nodes."""
 
-    def test_empty_nodes_returns_empty_context(self):
+    def test_empty_nodes_returns_empty_context(self, purge_cache):
         """Empty nodes list returns empty string."""
         result = build_context([], frozenset(), char_limit=1000)
         assert result == ""
 
-    def test_respects_char_limit(self):
+    def test_respects_char_limit(self, purge_cache):
         """Context doesn't exceed character limit."""
-        nodes = [MockNodeWithScore(text="a" * 1000, score=0.9, lemmas=["test"]) for _ in range(10)]
+        nodes = [bootstrap.MockNodeWithScore(text="a" * 1000, score=0.9, lemmas=["test"]) for _ in range(10)]
         qlem = frozenset(["test"])
 
         result = build_context(nodes, qlem, char_limit=500)
         assert len(result) <= 500
 
-    def test_deduplicates_identical_content(self):
+    def test_deduplicates_identical_content(self, purge_cache):
         """Identical content only appears once."""
         identical_text = "This is identical content"
         nodes = [
-            MockNodeWithScore(text=identical_text, score=0.9, lemmas=["test"]),
-            MockNodeWithScore(text=identical_text, score=0.8, lemmas=["test"]),
+            bootstrap.MockNodeWithScore(text=identical_text, score=0.9, lemmas=["test"]),
+            bootstrap.MockNodeWithScore(text=identical_text, score=0.8, lemmas=["test"]),
         ]
         qlem = frozenset(["test"])
 
         result = build_context(nodes, qlem, char_limit=5000)
         assert result.count(identical_text) == 1
 
-    def test_prioritizes_high_scoring_nodes(self):
+    def test_prioritizes_high_scoring_nodes(self, purge_cache):
         """Higher scored nodes appear first."""
         nodes = [
-            MockNodeWithScore(text="low", score=0.3, lemmas=["test"]),
-            MockNodeWithScore(text="high", score=0.9, lemmas=["test"]),
+            bootstrap.MockNodeWithScore(text="low", score=0.3, lemmas=["test"]),
+            bootstrap.MockNodeWithScore(text="high", score=0.9, lemmas=["test"]),
         ]
         qlem = frozenset(["test"])
 
         result = build_context(nodes, qlem, char_limit=5000)
-        if "high" in result and "low" in result:
-            assert result.index("high") < result.index("low")
+        assert "high" in result, "expected 'high' in context output"
+        assert "low" in result, "expected 'low' in context output"
+        assert result.index("high") < result.index("low")
 
-    def test_includes_separator_between_chunks(self):
+    def test_includes_separator_between_chunks(self, purge_cache):
         """Multiple chunks are separated by separator."""
         nodes = [
-            MockNodeWithScore(text="chunk1", score=0.9, lemmas=["test"]),
-            MockNodeWithScore(text="chunk2", score=0.8, lemmas=["test"]),
+            bootstrap.MockNodeWithScore(text="chunk1", score=0.9, lemmas=["test"]),
+            bootstrap.MockNodeWithScore(text="chunk2", score=0.8, lemmas=["test"]),
         ]
         qlem = frozenset(["test"])
 
         result = build_context(nodes, qlem, char_limit=5000)
-        if "chunk1" in result and "chunk2" in result:
-            assert "---" in result
+        assert "chunk1" in result, "expected 'chunk1' in context output"
+        assert "chunk2" in result, "expected 'chunk2' in context output"
+        assert "---" in result
 
-    def test_handles_empty_text_nodes(self):
+    def test_handles_empty_text_nodes(self, purge_cache):
         """Nodes with empty text are skipped."""
         nodes = [
-            MockNodeWithScore(text="", score=0.9, lemmas=["test"]),
-            MockNodeWithScore(text="valid", score=0.8, lemmas=["test"]),
+            bootstrap.MockNodeWithScore(text="", score=0.9, lemmas=["test"]),
+            bootstrap.MockNodeWithScore(text="valid", score=0.8, lemmas=["test"]),
         ]
         qlem = frozenset(["test"])
 
@@ -180,19 +140,21 @@ class TestContextBuilding:
 class TestCacheFunctionality:
     """Test cache management."""
 
-    def test_purge_cache_clears_all_entries(self):
-        """purge_filter_cache removes all cached entries."""
-        nodes = [MockNodeWithScore(text="test", score=0.8, lemmas=["test"])]
-        qlem = frozenset(["test"])
+    @pytest.mark.asyncio
+    async def test_purge_cache_clears_all_entries(self, purge_cache, single_high_node, query_lemmas):
+        """Cache purge must not corrupt state; subsequent lookup returns consistent results."""
+        nodes = [single_high_node]
 
-        asyncio.run(get_filtered_nodes(nodes, qlem))
+        result_before = await get_filtered_nodes(nodes, query_lemmas)
         purge_filter_cache()
-        asyncio.run(get_filtered_nodes(nodes, qlem))
+        result_after = await get_filtered_nodes(nodes, query_lemmas)
 
-    def test_cache_key_uniqueness(self):
+        assert len(result_before) == len(result_after)
+
+    def test_cache_key_uniqueness(self, purge_cache):
         """Different inputs produce different cache keys."""
-        nodes1 = [MockNodeWithScore(text="doc1", score=0.8, lemmas=["apple"])]
-        nodes2 = [MockNodeWithScore(text="doc2", score=0.7, lemmas=["banana"])]
+        nodes1 = [bootstrap.MockNodeWithScore(text="doc1", score=0.8, lemmas=["apple"])]
+        nodes2 = [bootstrap.MockNodeWithScore(text="doc2", score=0.7, lemmas=["banana"])]
 
         qlem1 = frozenset(["apple"])
         qlem2 = frozenset(["banana"])
